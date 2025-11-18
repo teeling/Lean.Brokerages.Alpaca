@@ -84,17 +84,17 @@ namespace QuantConnect.Brokerages.Alpaca
                 {
                     Logging.Log.Trace($"AlpacaStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): using custom URL");
 
-                    // Get default configuration for the environment, then override the WebSocket URL
+                    // Get default configuration for the environment, then override the API endpoint
                     if (_securityType == SecurityType.Crypto)
                     {
                         var config = EnvironmentExtensions.GetAlpacaCryptoStreamingClientConfiguration(environment, _securityKey);
-                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        config.ApiEndpoint = new Uri(_customStreamingUrl);
                         StreamingClient = config.GetClient();
                     }
                     else if (_securityType == SecurityType.Equity)
                     {
                         var config = EnvironmentExtensions.GetAlpacaDataStreamingClientConfiguration(environment, _securityKey);
-                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        config.ApiEndpoint = new Uri(_customStreamingUrl);
                         StreamingClient = config.GetClient();
                     }
                     else if (_securityType.IsOption())
@@ -102,7 +102,7 @@ namespace QuantConnect.Brokerages.Alpaca
                         // Use paid feed (Opra) for Live, free feed (Indicative) for Paper
                         var feed = environment == Environments.Live ? OptionsFeed.Opra : OptionsFeed.Indicative;
                         var config = EnvironmentExtensions.GetAlpacaOptionsStreamingClientConfiguration(environment, _securityKey, feed);
-                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        config.ApiEndpoint = new Uri(_customStreamingUrl);
                         StreamingClient = config.GetClient();
                     }
                     else
