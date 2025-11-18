@@ -183,14 +183,21 @@ namespace QuantConnect.Brokerages.Alpaca
 
             if (secretKey != null)
             {
+                // Read custom data streaming URL from configuration (for proxy support)
+                var customDataStreamingUrl = Config.Get("alpaca-data-streaming-url", string.Empty);
+                if (!string.IsNullOrEmpty(customDataStreamingUrl))
+                {
+                    Log.Trace($"AlpacaBrokerage.Initialize(): Using custom data streaming URL: {customDataStreamingUrl}");
+                }
+
                 // equity streaming client
-                _equityStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Equity);
+                _equityStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Equity, customDataStreamingUrl);
 
                 // streaming crypto
-                _cryptoStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Crypto);
+                _cryptoStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Crypto, customDataStreamingUrl);
 
                 // streaming options
-                _optionsStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Option);
+                _optionsStreamingClient = new AlpacaStreamingClientWrapper(secretKey, SecurityType.Option, customDataStreamingUrl);
 
                 foreach (var streamingClient in new IStreamingClient[] { _cryptoStreamingClient, _optionsStreamingClient, _equityStreamingClient })
                 {

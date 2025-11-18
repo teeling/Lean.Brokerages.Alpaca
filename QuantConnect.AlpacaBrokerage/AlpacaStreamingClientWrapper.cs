@@ -28,6 +28,7 @@ namespace QuantConnect.Brokerages.Alpaca
     {
         private readonly SecurityKey _securityKey;
         private readonly SecurityType _securityType;
+        private readonly string _customStreamingUrl;
         private IEnvironment[] _environments = new[] { Environments.Live, Environments.Paper };
 
         public IStreamingDataClient StreamingClient { get; set; }
@@ -44,10 +45,19 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <summary>
         /// Creates a new instance using the target security key and security type
         /// </summary>
-        public AlpacaStreamingClientWrapper(SecurityKey securityKey, SecurityType securityType)
+        /// <param name="securityKey">The security key for authentication</param>
+        /// <param name="securityType">The security type (Equity, Crypto, Option)</param>
+        /// <param name="customStreamingUrl">Optional custom WebSocket URL (e.g., for proxy support)</param>
+        public AlpacaStreamingClientWrapper(SecurityKey securityKey, SecurityType securityType, string customStreamingUrl = null)
         {
             _securityKey = securityKey;
             _securityType = securityType;
+            _customStreamingUrl = customStreamingUrl;
+
+            if (!string.IsNullOrEmpty(_customStreamingUrl))
+            {
+                Logging.Log.Trace($"AlpacaStreamingClientWrapper: Using custom streaming URL: {_customStreamingUrl}");
+            }
         }
 
         public async Task<AuthStatus> ConnectAndAuthenticateAsync(CancellationToken cancellationToken = default)
@@ -68,35 +78,71 @@ namespace QuantConnect.Brokerages.Alpaca
                     StreamingClient.DisposeSafely();
                 }
 
-                var feedType = environment == Environments.Live ? "paid" : "free";
-                Logging.Log.Trace($"AlpacaStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): try connecting {feedType} feed");
-                if (_securityType == SecurityType.Crypto)
+                // If custom URL is provided, use it instead of default Alpaca endpoints
+                if (!string.IsNullOrEmpty(_customStreamingUrl))
                 {
-                    StreamingClient = EnvironmentExtensions.GetAlpacaCryptoStreamingClient(environment, _securityKey);
-                }
-                else if (_securityType == SecurityType.Equity)
-                {
-                    var feed = $"'{MarketDataFeed.Iex}'";
-                    if (environment == Environments.Live)
+                    Logging.Log.Trace($"AlpacaStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): using custom URL");
+                    
+                    // Create custom configuration with proxy URL
+                    var customConfig = new AlpacaStreamingClientConfiguration
                     {
-                        feed = $"'{MarketDataFeed.Sip}', will retry with free feed";
-                    }
-                    failureMessage = $"{_securityType} failed to connect to live feed {feed}";
-                    StreamingClient = EnvironmentExtensions.GetAlpacaDataStreamingClient(environment, _securityKey);
-                }
-                else if (_securityType.IsOption())
-                {
-                    var feed = $"'{OptionsFeed.Indicative}'";
-                    if (environment == Environments.Live)
+                        SecurityId = _securityKey,
+                        WebSocketUrl = new Uri(_customStreamingUrl)
+                    };
+                    
+                    if (_securityType == SecurityType.Crypto)
                     {
-                        feed = $"'{OptionsFeed.Opra}', will retry with free feed";
+                        StreamingClient = new AlpacaCryptoStreamingClient(customConfig);
                     }
-                    failureMessage = $"{_securityType} failed to connect to live feed {feed}";
-                    StreamingClient = EnvironmentExtensions.GetAlpacaOptionsStreamingClient(environment, _securityKey);
+                    else if (_securityType == SecurityType.Equity)
+                    {
+                        StreamingClient = new AlpacaDataStreamingClient(customConfig);
+                    }
+                    else if (_securityType.IsOption())
+                    {
+                        StreamingClient = new AlpacaOptionsStreamingClient(customConfig);
+                    }
+                    else
+                    {
+                        throw new NotImplementedException();
+                    }
+                    
+                    // Skip environment retry loop when using custom URL
+                    _environments = new[] { environment };
                 }
                 else
                 {
-                    throw new NotImplementedException();
+                    // Use default Alpaca endpoints (original code)
+                    var feedType = environment == Environments.Live ? "paid" : "free";
+                    Logging.Log.Trace($"AlpacaStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): try connecting {feedType} feed");
+                    if (_securityType == SecurityType.Crypto)
+                    {
+                        StreamingClient = EnvironmentExtensions.GetAlpacaCryptoStreamingClient(environment, _securityKey);
+                    }
+                    else if (_securityType == SecurityType.Equity)
+                    {
+                        var feed = $"'{MarketDataFeed.Iex}'";
+                        if (environment == Environments.Live)
+                        {
+                            feed = $"'{MarketDataFeed.Sip}', will retry with free feed";
+                        }
+                        failureMessage = $"{_securityType} failed to connect to live feed {feed}";
+                        StreamingClient = EnvironmentExtensions.GetAlpacaDataStreamingClient(environment, _securityKey);
+                    }
+                    else if (_securityType.IsOption())
+                    {
+                        var feed = $"'{OptionsFeed.Indicative}'";
+                        if (environment == Environments.Live)
+                        {
+                            feed = $"'{OptionsFeed.Opra}', will retry with free feed";
+                        }
+                        failureMessage = $"{_securityType} failed to connect to live feed {feed}";
+                        StreamingClient = EnvironmentExtensions.GetAlpacaOptionsStreamingClient(environment, _securityKey);
+                    }
+                    else
+                    {
+                        throw new NotImplementedException();
+                    }
                 }
 
                 StreamingClient.Connected += HandleConnected;
