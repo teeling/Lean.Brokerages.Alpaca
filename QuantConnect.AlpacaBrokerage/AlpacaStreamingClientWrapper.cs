@@ -82,25 +82,25 @@ namespace QuantConnect.Brokerages.Alpaca
                 if (!string.IsNullOrEmpty(_customStreamingUrl))
                 {
                     Logging.Log.Trace($"AlpacaStreamingClientWrapper.ConnectAndAuthenticateAsync({_securityType}): using custom URL");
-                    
-                    // Create custom configuration with proxy URL
-                    var customConfig = new AlpacaStreamingClientConfiguration
-                    {
-                        SecurityId = _securityKey,
-                        WebSocketUrl = new Uri(_customStreamingUrl)
-                    };
-                    
+
+                    // Get default configuration for the environment, then override the WebSocket URL
                     if (_securityType == SecurityType.Crypto)
                     {
-                        StreamingClient = new AlpacaCryptoStreamingClient(customConfig);
+                        var config = EnvironmentExtensions.GetAlpacaCryptoStreamingClientConfiguration(environment, _securityKey);
+                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        StreamingClient = config.GetClient();
                     }
                     else if (_securityType == SecurityType.Equity)
                     {
-                        StreamingClient = new AlpacaDataStreamingClient(customConfig);
+                        var config = EnvironmentExtensions.GetAlpacaDataStreamingClientConfiguration(environment, _securityKey);
+                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        StreamingClient = config.GetClient();
                     }
                     else if (_securityType.IsOption())
                     {
-                        StreamingClient = new AlpacaOptionsStreamingClient(customConfig);
+                        var config = EnvironmentExtensions.GetAlpacaOptionsStreamingClientConfiguration(environment, _securityKey);
+                        config.WebSocketUrl = new Uri(_customStreamingUrl);
+                        StreamingClient = config.GetClient();
                     }
                     else
                     {
