@@ -15,6 +15,7 @@
 
 using System;
 using Alpaca.Markets;
+using Alpaca.Markets.Extensions;
 using System.Threading;
 using QuantConnect.Util;
 using System.Threading.Tasks;
@@ -98,7 +99,9 @@ namespace QuantConnect.Brokerages.Alpaca
                     }
                     else if (_securityType.IsOption())
                     {
-                        var config = EnvironmentExtensions.GetAlpacaOptionsStreamingClientConfiguration(environment, _securityKey);
+                        // Use paid feed (Opra) for Live, free feed (Indicative) for Paper
+                        var feed = environment == Environments.Live ? OptionsFeed.Opra : OptionsFeed.Indicative;
+                        var config = EnvironmentExtensions.GetAlpacaOptionsStreamingClientConfiguration(environment, _securityKey, feed);
                         config.WebSocketUrl = new Uri(_customStreamingUrl);
                         StreamingClient = config.GetClient();
                     }
