@@ -98,6 +98,31 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         private readonly HashSet<AlpacaMarket.TimeInForce> _unsupportedTimeInForce = [];
 
+        // --- Bracket order support ---
+
+        /// <summary>
+        /// Maps Alpaca leg order GUIDs to bracket leg info for routing trade updates
+        /// to the correct LEAN orders and managing leg lifecycle.
+        /// </summary>
+        private readonly ConcurrentDictionary<Guid, BracketLegInfo> _bracketLegMapping = new();
+
+        /// <summary>
+        /// Reference to the BracketOrderManager for leg registration.
+        /// Set by the manager during initialization via RegisterManager().
+        /// </summary>
+        private BracketOrderManager _bracketManager;
+
+        /// <summary>
+        /// Called by <see cref="BracketOrderManager"/> to register itself with this
+        /// brokerage, enabling leg ticket registration when exit legs are created.
+        /// </summary>
+        /// <param name="manager">The BracketOrderManager instance.</param>
+        public void RegisterManager(BracketOrderManager manager)
+        {
+            _bracketManager = manager;
+            Log.Debug($"{nameof(AlpacaBrokerage)}.RegisterManager: BracketOrderManager registered.");
+        }
+
         /// <summary>
         /// Returns true if we're currently connected to the broker
         /// </summary>
@@ -416,7 +441,10 @@ namespace QuantConnect.Brokerages.Alpaca
         }
 
         /// <summary>
-        /// Places a new order and assigns a new broker ID to the order
+        /// Places a new order and assigns a new broker ID to the order.
+        /// Detects bracket orders (orders with <see cref="AlpacaBracketOrderProperties"/>)
+        /// and routes them through the bracket-specific submission path which uses
+        /// Alpaca's native bracket API.
         /// </summary>
         /// <param name="order">The order to be placed</param>
         /// <returns>True if the request for a new order has been placed, false otherwise</returns>
@@ -432,6 +460,19 @@ namespace QuantConnect.Brokerages.Alpaca
             {
                 _messageHandler.WithLockedStream(() =>
                 {
+                    // --- Check for bracket order ---
+                    if (order.Properties is AlpacaBracketOrderProperties bracketProps && bracketProps.IsBracketOrder)
+                    {
+                        Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOrder: Detected bracket entry order. " +
+                            $"OrderId={order.Id}, GroupId={bracketProps.BracketGroupId}, " +
+                            $"Symbol={order.Symbol}, Qty={order.Quantity}, " +
+                            $"Stop={bracketProps.StopLossStopPrice}, Target={bracketProps.TakeProfitLimitPrice}, " +
+                            $"StopLimit={bracketProps.StopLossLimitPrice}");
+                        PlaceBracketOrder(order, bracketProps);
+                        return;
+                    }
+
+                    // --- Standard (non-bracket) order flow ---
                     var holdingQuantity = _securityProvider.GetHoldingsQuantity(order.Symbol);
                     var isPlaceCrossOrder = TryCrossZeroPositionOrder(order, holdingQuantity);
                     if (isPlaceCrossOrder == null)
@@ -456,12 +497,200 @@ namespace QuantConnect.Brokerages.Alpaca
             return true;
         }
 
+        /// <summary>
+        /// Places a bracket order using Alpaca's native bracket API.
+        /// Creates all three orders (entry + stop-loss + take-profit) atomically
+        /// in a single API call. The response contains the parent order and its legs,
+        /// each with their own Alpaca order IDs.
+        ///
+        /// After successful submission:
+        /// 1. Maps the entry order's Alpaca ID to the LEAN order
+        /// 2. Creates phantom LEAN orders for each leg via OnNewBrokerageOrderNotification
+        /// 3. Registers leg tickets with the BracketOrderManager
+        /// </summary>
+        private void PlaceBracketOrder(Order order, AlpacaBracketOrderProperties bracketProps)
+        {
+            try
+            {
+                // Step 1: Create the base entry order using existing extension method.
+                // CreateAlpacaOrder returns OrderBase, but .Bracket() is defined on
+                // SimpleOrderBase. Bracket entries must be Market or Limit orders,
+                // both of which extend SimpleOrderBase, so the cast is safe.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Creating base entry order for group {bracketProps.BracketGroupId}");
+                var baseOrder = order.CreateAlpacaOrder(order.AbsoluteQuantity, _symbolMapper, order.Type);
+
+                if (baseOrder is not AlpacaMarket.SimpleOrderBase simpleBaseOrder)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Entry order type {order.Type} " +
+                        $"does not support .Bracket(). Only Market and Limit entries are supported.");
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                        $"Bracket entry type {order.Type} not supported. Use Market or Limit.")
+                    { Status = Orders.OrderStatus.Invalid });
+                    return;
+                }
+
+                // Step 2: Chain .Bracket() call to create the bracket order.
+                // .Bracket() returns a BracketOrder which extends AdvancedOrderBase → OrderBase.
+                // PostOrderAsync accepts OrderBase, so this works directly.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Chaining .Bracket() call. " +
+                    $"TakeProfit={bracketProps.TakeProfitLimitPrice}, StopLoss={bracketProps.StopLossStopPrice}, " +
+                    $"StopLossLimit={bracketProps.StopLossLimitPrice}");
+
+                AlpacaMarket.OrderBase bracketOrder;
+                if (bracketProps.StopLossLimitPrice.HasValue)
+                {
+                    // Bracket with stop-limit leg
+                    bracketOrder = simpleBaseOrder.Bracket(
+                        takeProfitLimitPrice: bracketProps.TakeProfitLimitPrice.Value,
+                        stopLossStopPrice: bracketProps.StopLossStopPrice.Value,
+                        stopLossLimitPrice: bracketProps.StopLossLimitPrice.Value);
+                }
+                else
+                {
+                    // Bracket with stop-market leg
+                    bracketOrder = simpleBaseOrder.Bracket(
+                        takeProfitLimitPrice: bracketProps.TakeProfitLimitPrice.Value,
+                        stopLossStopPrice: bracketProps.StopLossStopPrice.Value);
+                }
+
+                // Step 3: Submit to Alpaca
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Submitting bracket order to Alpaca for group {bracketProps.BracketGroupId}");
+                var response = _tradingClient.PostOrderAsync(bracketOrder).SynchronouslyAwaitTaskResult();
+
+                if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Bracket order REJECTED by Alpaca for group {bracketProps.BracketGroupId}. " +
+                        $"Response: {response?.OrderStatus}");
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                        "Bracket Order Rejected by Alpaca") { Status = Orders.OrderStatus.Invalid });
+                    return;
+                }
+
+                // Step 4: Map the entry order
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Bracket order ACCEPTED. " +
+                    $"EntryAlpacaId={response.OrderId}, LegsCount={response.Legs.Count}, " +
+                    $"GroupId={bracketProps.BracketGroupId}");
+
+                order.BrokerId.Add(response.OrderId.ToString());
+                _duplicationExecutionOrderIdByBrokerageOrderId.TryAdd(response.OrderId, []);
+
+                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                    $"Bracket Order Submitted (group: {bracketProps.BracketGroupId})")
+                { Status = Orders.OrderStatus.Submitted });
+
+                // Step 5: Create phantom LEAN orders for the legs
+                // The legs are available immediately in the response even though
+                // they won't activate until the entry fills.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Processing {response.Legs.Count} legs " +
+                    $"for group {bracketProps.BracketGroupId}");
+
+                foreach (var leg in response.Legs)
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Processing leg. " +
+                        $"AlpacaId={leg.OrderId}, Type={leg.OrderType}, Side={leg.OrderSide}, " +
+                        $"LimitPrice={leg.LimitPrice}, StopPrice={leg.StopPrice}");
+                    CreateAndRegisterLegOrder(leg, order.Symbol, bracketProps);
+                }
+
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Bracket order fully processed for group {bracketProps.BracketGroupId}");
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Exception placing bracket order for group {bracketProps.BracketGroupId}: {ex}");
+                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                    $"Bracket Order Failed: {ex.Message}") { Status = Orders.OrderStatus.Invalid });
+            }
+        }
+
+        /// <summary>
+        /// Creates a phantom LEAN order for an Alpaca bracket leg and registers it
+        /// with the deduplication map, bracket leg mapping, and BracketOrderManager.
+        /// </summary>
+        private void CreateAndRegisterLegOrder(IOrder alpacaLeg, Symbol symbol,
+            AlpacaBracketOrderProperties bracketProps)
+        {
+            // Convert the Alpaca leg order to a LEAN order
+            if (!TryConvertToLeanOrder(alpacaLeg, out var leanOrder))
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Failed to convert bracket leg " +
+                    $"AlpacaId={alpacaLeg.OrderId} to LEAN order for group {bracketProps.BracketGroupId}");
+                return;
+            }
+
+            // Determine the leg type based on the Alpaca order type
+            var legType = alpacaLeg.OrderType switch
+            {
+                AlpacaMarket.OrderType.Limit => BracketLegType.TakeProfit,
+                AlpacaMarket.OrderType.Stop => BracketLegType.StopLoss,
+                AlpacaMarket.OrderType.StopLimit => BracketLegType.StopLoss,
+                _ => throw new NotSupportedException(
+                    $"Unexpected bracket leg order type: {alpacaLeg.OrderType}")
+            };
+
+            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Leg type={legType}, " +
+                $"AlpacaId={alpacaLeg.OrderId}, LeanOrderType={leanOrder.Type}, " +
+                $"GroupId={bracketProps.BracketGroupId}");
+
+            // Tag the LEAN order with bracket properties
+            var legProps = new AlpacaBracketOrderProperties
+            {
+                BracketGroupId = bracketProps.BracketGroupId,
+                LegType = legType
+            };
+            leanOrder.Properties = legProps;
+
+            // Register in the bracket leg mapping for trade update routing
+            _bracketLegMapping[alpacaLeg.OrderId] = new BracketLegInfo
+            {
+                BracketGroupId = bracketProps.BracketGroupId,
+                AlpacaLegOrderId = alpacaLeg.OrderId,
+                LegType = legType,
+            };
+
+            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Registered leg in _bracketLegMapping. " +
+                $"AlpacaId={alpacaLeg.OrderId}, GroupId={bracketProps.BracketGroupId}, Type={legType}");
+
+            // Notify LEAN's engine about this new order so it creates tracking structures
+            OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(leanOrder));
+
+            // The engine processes the notification asynchronously and assigns a LEAN order ID.
+            // Register with BracketOrderManager after the ticket is available.
+            // Note: The ticket may not be immediately available; HandleTradeUpdate will also
+            // try to register if needed when events arrive.
+            if (_bracketManager != null && leanOrder.Id != 0)
+            {
+                var ticket = _orderProvider.GetOrderTicket(leanOrder.Id);
+                if (ticket != null)
+                {
+                    _bracketManager.RegisterLegTicket(bracketProps.BracketGroupId, legType, ticket);
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Registered leg ticket " +
+                        $"LeanId={leanOrder.Id} with BracketOrderManager for group {bracketProps.BracketGroupId}");
+                }
+                else
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Ticket not yet available " +
+                        $"for LeanId={leanOrder.Id}. Will be registered when trade update arrives.");
+                }
+            }
+        }
+
         internal void HandleTradeUpdate(ITradeUpdate obj)
         {
             try
             {
                 // TODO: Revert to Log.Debug when issue #28 is resolved
                 Log.Trace($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: {obj}");
+
+                // --- Bracket leg identification ---
+                // Check if this trade update is for a known bracket leg by Alpaca order ID.
+                // This helps with logging context and bracket-specific handling.
+                var isBracketLeg = _bracketLegMapping.TryGetValue(obj.Order.OrderId, out var bracketLegInfo);
+                if (isBracketLeg)
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: Event for bracket leg. " +
+                        $"AlpacaId={obj.Order.OrderId}, GroupId={bracketLegInfo.BracketGroupId}, " +
+                        $"LegType={bracketLegInfo.LegType}, Event={obj.Event}");
+                }
 
                 var brokerageOrderId = obj.Order.OrderId.ToString();
                 var newLeanOrderStatus = GetOrderStatus(obj.Event);
@@ -490,8 +719,22 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
                 if (leanOrder == null)
                 {
-                    Log.Error($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: order id not found: {obj.Order.OrderId}");
+                    Log.Error($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: order id not found: {obj.Order.OrderId}" +
+                        (isBracketLeg ? $" (bracket leg: {bracketLegInfo})" : ""));
                     return;
+                }
+
+                // --- Try to register bracket leg ticket if we haven't yet ---
+                // The ticket might not have been available when the leg was first created
+                // (async processing). Now that we have the LEAN order, we can register it.
+                if (isBracketLeg && _bracketManager != null)
+                {
+                    var ticket = _orderProvider.GetOrderTicket(leanOrder.Id);
+                    if (ticket != null)
+                    {
+                        // RegisterLegTicket is idempotent — it's fine to call multiple times
+                        _bracketManager.RegisterLegTicket(bracketLegInfo.BracketGroupId, bracketLegInfo.LegType, ticket);
+                    }
                 }
 
                 switch (obj.Event)
@@ -517,6 +760,19 @@ namespace QuantConnect.Brokerages.Alpaca
                                     OnOrderIdChangedEvent(new() { OrderId = leanOrder.Id, BrokerId = [replacedBrokerageOrderId.ToString()] });
                                 }
                                 _duplicationExecutionOrderIdByBrokerageOrderId[replacedBrokerageOrderId] = [];
+
+                                // --- Bracket leg ID remapping on Replaced ---
+                                // When Alpaca replaces a bracket leg (e.g., due to partial fill on
+                                // the sibling, or a PATCH update), the old Alpaca ID becomes invalid
+                                // and a new one is assigned. Update our tracking.
+                                if (isBracketLeg && _bracketLegMapping.TryRemove(obj.Order.OrderId, out var oldLegInfo))
+                                {
+                                    oldLegInfo.AlpacaLegOrderId = replacedBrokerageOrderId;
+                                    _bracketLegMapping[replacedBrokerageOrderId] = oldLegInfo;
+                                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: Remapped bracket leg. " +
+                                        $"OldAlpacaId={obj.Order.OrderId} → NewAlpacaId={replacedBrokerageOrderId}, " +
+                                        $"GroupId={oldLegInfo.BracketGroupId}, LegType={oldLegInfo.LegType}");
+                                }
                             }
 
                             if (!_tradeEventReason.TryGetValue(obj.Event, out var message))
@@ -524,18 +780,45 @@ namespace QuantConnect.Brokerages.Alpaca
                                 message = $"{nameof(AlpacaBrokerage)} Order Event";
                             }
 
-                            OnOrderEvent(new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero, message) { Status = newLeanOrderStatus });
+                            // Add bracket context to the message if applicable
+                            if (isBracketLeg)
+                            {
+                                message += $" [bracket leg: {bracketLegInfo.LegType}, group: {bracketLegInfo.BracketGroupId}]";
+                            }
+
+                            var statusEvent = new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero, message) { Status = newLeanOrderStatus };
+                            OnOrderEvent(statusEvent);
+
+                            // Forward cancel/reject/expire events to BracketOrderManager for state tracking
+                            if (isBracketLeg || _bracketManager?.GetGroupIdForOrder(leanOrder.Id) != null)
+                            {
+                                _bracketManager?.ProcessOrderEvent(statusEvent);
+                            }
                         }
                         return;
                     case TradeEvent.Fill:
                         if (_duplicationExecutionOrderIdByBrokerageOrderId.Remove(obj.Order.OrderId))
                         {
+                            if (isBracketLeg)
+                            {
+                                Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: Bracket leg FILL. " +
+                                    $"AlpacaId={obj.Order.OrderId}, GroupId={bracketLegInfo.BracketGroupId}, " +
+                                    $"LegType={bracketLegInfo.LegType}, Price={obj.Price}. " +
+                                    $"Alpaca will handle OCO cancellation of the sibling leg.");
+                            }
                             break;
                         }
                         return;
                     case TradeEvent.PartialFill:
                         if (_duplicationExecutionOrderIdByBrokerageOrderId[obj.Order.OrderId].Add(obj.ExecutionId.Value))
                         {
+                            if (isBracketLeg)
+                            {
+                                Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: Bracket leg PARTIAL FILL. " +
+                                    $"AlpacaId={obj.Order.OrderId}, GroupId={bracketLegInfo.BracketGroupId}, " +
+                                    $"LegType={bracketLegInfo.LegType}, Price={obj.Price}, " +
+                                    $"FilledQty={obj.Order.FilledQuantity}/{obj.Order.Quantity}");
+                            }
                             break;
                         }
                         return;
@@ -581,6 +864,13 @@ namespace QuantConnect.Brokerages.Alpaca
                 {
                     OnOrderEvent(orderEvent);
                 }
+
+                // Forward fill/partial fill events to BracketOrderManager for state tracking.
+                // This must happen after OnOrderEvent so the order status is updated in LEAN first.
+                if (isBracketLeg || _bracketManager?.GetGroupIdForOrder(leanOrder.Id) != null)
+                {
+                    _bracketManager?.ProcessOrderEvent(orderEvent);
+                }
             }
             catch (Exception ex)
             {
@@ -590,7 +880,9 @@ namespace QuantConnect.Brokerages.Alpaca
         }
 
         /// <summary>
-        /// Updates the order with the same id
+        /// Updates the order with the same id.
+        /// For bracket legs, also updates the _bracketLegMapping with the new Alpaca order ID
+        /// that results from the PATCH operation (Alpaca replaces the order).
         /// </summary>
         /// <param name="order">The new order information</param>
         /// <returns>True if the request was made for the order to be updated, false otherwise</returns>
@@ -603,6 +895,18 @@ namespace QuantConnect.Brokerages.Alpaca
             }
 
             var brokerageOrderId = order.BrokerId.Last();
+
+            // Debug logging for bracket leg updates
+            var oldAlpacaGuid = new Guid(brokerageOrderId);
+            var isBracketLeg = _bracketLegMapping.TryGetValue(oldAlpacaGuid, out var legInfo);
+            if (isBracketLeg)
+            {
+                Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(UpdateOrder)}: Updating bracket leg. " +
+                    $"LeanOrderId={order.Id}, AlpacaId={brokerageOrderId}, " +
+                    $"GroupId={legInfo.BracketGroupId}, LegType={legInfo.LegType}, " +
+                    $"OrderType={order.Type}");
+            }
+
             var pathOrderRequest = new ChangeOrderRequest(new Guid(brokerageOrderId)) { Quantity = Convert.ToInt64(Math.Abs(orderQuantity)) };
 
             switch (order)
@@ -638,6 +942,17 @@ namespace QuantConnect.Brokerages.Alpaca
                     if (!order.BrokerId.Contains(brokerageOrderId))
                     {
                         order.BrokerId.Add(brokerageOrderId);
+                    }
+
+                    // --- Bracket leg: remap Alpaca order ID after PATCH ---
+                    // Alpaca replaces the order, giving it a new ID. Update our tracking.
+                    if (isBracketLeg && _bracketLegMapping.TryRemove(oldAlpacaGuid, out var oldLegInfo))
+                    {
+                        oldLegInfo.AlpacaLegOrderId = response.OrderId;
+                        _bracketLegMapping[response.OrderId] = oldLegInfo;
+                        Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(UpdateOrder)}: Remapped bracket leg after PATCH. " +
+                            $"OldAlpacaId={oldAlpacaGuid} → NewAlpacaId={response.OrderId}, " +
+                            $"GroupId={oldLegInfo.BracketGroupId}, LegType={oldLegInfo.LegType}");
                     }
                 });
                 return response != null && response.OrderStatus != AlpacaMarket.OrderStatus.Rejected;
@@ -1039,6 +1354,28 @@ namespace QuantConnect.Brokerages.Alpaca
                 Log.Error($"ValidateSubscription(): Failed during validation, shutting down. Error : {e.Message}");
                 Environment.Exit(1);
             }
+        }
+    }
+
+    /// <summary>
+    /// Tracks a bracket leg's relationship to its bracket group.
+    /// Used to route Alpaca trade update events for bracket legs
+    /// to the correct LEAN orders and bracket groups.
+    /// </summary>
+    internal class BracketLegInfo
+    {
+        /// <summary>The bracket group this leg belongs to.</summary>
+        public string BracketGroupId { get; set; }
+
+        /// <summary>The Alpaca order ID of this leg.</summary>
+        public Guid AlpacaLegOrderId { get; set; }
+
+        /// <summary>Whether this is a stop-loss or take-profit leg.</summary>
+        public BracketLegType LegType { get; set; }
+
+        public override string ToString()
+        {
+            return $"BracketLegInfo[Group={BracketGroupId}, AlpacaId={AlpacaLegOrderId}, Type={LegType}]";
         }
     }
 }
