@@ -58,6 +58,15 @@ namespace QuantConnect.Brokerages.Alpaca
 
         private ConcurrentDictionary<int, decimal> _orderIdToFillQuantity = new();
         private BrokerageConcurrentMessageHandler<ITradeUpdate> _messageHandler;
+
+        /// <summary>
+        /// Provisional mapping of Alpaca brokerage order ID → LEAN Order for bracket legs.
+        /// Bracket legs are created via OnNewBrokerageOrderNotification which is processed
+        /// asynchronously by LEAN's engine. WebSocket trade updates may arrive before the
+        /// engine registers the order, so we store the order here for immediate lookup.
+        /// Follows the same pattern as LeanOrderByZeroCrossBrokerageOrderId for cross-zero orders.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Order> _provisionalBracketLegOrders = new();
         private AlpacaBrokerageSymbolMapper _symbolMapper;
 
         private IAlpacaTradingClient _tradingClient;
@@ -89,7 +98,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <summary>
         /// Maps each brokerage order ID to a set of execution IDs, used to detect and skip duplicate trade updates.
         /// </summary>
-        internal readonly Dictionary<Guid, HashSet<Guid>> _duplicationExecutionOrderIdByBrokerageOrderId = [];
+        internal readonly ConcurrentDictionary<Guid, HashSet<Guid>> _duplicationExecutionOrderIdByBrokerageOrderId = new();
 
         /// <summary>
         /// Tracks unsupported TimeInForce values detected during order conversion.
@@ -376,12 +385,17 @@ namespace QuantConnect.Brokerages.Alpaca
 
                         if (legType.HasValue)
                         {
-                            // Tag with bracket properties for identification
-                            legLeanOrder.Properties = new AlpacaBracketOrderProperties
+                            // Re-convert with bracket properties so they're set via
+                            // the constructor (Order.Properties has a private setter)
+                            var bracketLegProps = new AlpacaBracketOrderProperties
                             {
                                 BracketGroupId = recoveryGroupId,
                                 LegType = legType.Value
                             };
+                            if (!TryConvertToLeanOrder(leg, out legLeanOrder, bracketLegProps))
+                            {
+                                continue;
+                            }
 
                             // Register in _bracketLegMapping so HandleTradeUpdate can
                             // route subsequent trade events for these legs correctly
@@ -405,7 +419,8 @@ namespace QuantConnect.Brokerages.Alpaca
             return leanOrders;
         }
 
-        private bool TryConvertToLeanOrder(IOrder brokerageOrder, out Order leanOrder)
+        private bool TryConvertToLeanOrder(IOrder brokerageOrder, out Order leanOrder,
+            AlpacaOrderProperties overrideProperties = null)
         {
             leanOrder = null;
 
@@ -423,7 +438,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 return false;
             }
 
-            var orderProperties = new AlpacaOrderProperties();
+            var orderProperties = overrideProperties ?? new AlpacaOrderProperties();
             if (!orderProperties.TryGetLeanTimeInForceByAlpacaTimeInForce(brokerageOrder.TimeInForce))
             {
                 if (_unsupportedTimeInForce.Add(brokerageOrder.TimeInForce))
@@ -695,14 +710,6 @@ namespace QuantConnect.Brokerages.Alpaca
         private void CreateAndRegisterLegOrder(IOrder alpacaLeg, Symbol symbol,
             AlpacaBracketOrderProperties bracketProps)
         {
-            // Convert the Alpaca leg order to a LEAN order
-            if (!TryConvertToLeanOrder(alpacaLeg, out var leanOrder))
-            {
-                Log.Error($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Failed to convert bracket leg " +
-                    $"AlpacaId={alpacaLeg.OrderId} to LEAN order for group {bracketProps.BracketGroupId}");
-                return;
-            }
-
             // Determine the leg type based on the Alpaca order type
             var legType = alpacaLeg.OrderType switch
             {
@@ -713,17 +720,25 @@ namespace QuantConnect.Brokerages.Alpaca
                     $"Unexpected bracket leg order type: {alpacaLeg.OrderType}")
             };
 
-            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Leg type={legType}, " +
-                $"AlpacaId={alpacaLeg.OrderId}, LeanOrderType={leanOrder.Type}, " +
-                $"GroupId={bracketProps.BracketGroupId}");
-
-            // Tag the LEAN order with bracket properties
+            // Build bracket properties and pass via TryConvertToLeanOrder so they're
+            // set through the constructor (Order.Properties has a private setter)
             var legProps = new AlpacaBracketOrderProperties
             {
                 BracketGroupId = bracketProps.BracketGroupId,
                 LegType = legType
             };
-            leanOrder.Properties = legProps;
+
+            // Convert the Alpaca leg order to a LEAN order with bracket properties
+            if (!TryConvertToLeanOrder(alpacaLeg, out var leanOrder, legProps))
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Failed to convert bracket leg " +
+                    $"AlpacaId={alpacaLeg.OrderId} to LEAN order for group {bracketProps.BracketGroupId}");
+                return;
+            }
+
+            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Leg type={legType}, " +
+                $"AlpacaId={alpacaLeg.OrderId}, LeanOrderType={leanOrder.Type}, " +
+                $"GroupId={bracketProps.BracketGroupId}");
 
             // Register in the bracket leg mapping for trade update routing
             _bracketLegMapping[alpacaLeg.OrderId] = new BracketLegInfo
@@ -735,6 +750,14 @@ namespace QuantConnect.Brokerages.Alpaca
 
             Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Registered leg in _bracketLegMapping. " +
                 $"AlpacaId={alpacaLeg.OrderId}, GroupId={bracketProps.BracketGroupId}, Type={legType}");
+
+            // Store in provisional mapping BEFORE firing the notification.
+            // This ensures HandleTradeUpdate can find the order even if WebSocket
+            // trade updates arrive before the engine processes the async notification.
+            var alpacaOrderIdStr = alpacaLeg.OrderId.ToString();
+            _provisionalBracketLegOrders[alpacaOrderIdStr] = leanOrder;
+            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Stored in provisional mapping. " +
+                $"AlpacaId={alpacaOrderIdStr}, GroupId={bracketProps.BracketGroupId}, Type={legType}");
 
             // Notify LEAN's engine about this new order so it creates tracking structures
             OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(leanOrder));
@@ -803,6 +826,23 @@ namespace QuantConnect.Brokerages.Alpaca
                         }
                     }
                 }
+                // --- Bracket leg provisional lookup ---
+                // If the order wasn't found via normal channels, check the provisional
+                // bracket leg mapping. This handles the race condition where WebSocket
+                // trade updates arrive before LEAN's engine processes the async
+                // OnNewBrokerageOrderNotification for bracket legs.
+                if (leanOrder == null && _provisionalBracketLegOrders.TryGetValue(brokerageOrderId, out leanOrder))
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: Found bracket leg in provisional mapping. " +
+                        $"AlpacaId={brokerageOrderId}, LeanOrderType={leanOrder.Type}");
+                }
+
+                // Clean up provisional mapping when order reaches terminal status
+                if (leanOrder != null && newLeanOrderStatus.IsClosed())
+                {
+                    _provisionalBracketLegOrders.TryRemove(brokerageOrderId, out _);
+                }
+
                 if (leanOrder == null)
                 {
                     Log.Error($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: order id not found: {obj.Order.OrderId}" +
@@ -834,7 +874,7 @@ namespace QuantConnect.Brokerages.Alpaca
                     case TradeEvent.Canceled:
                     case TradeEvent.Replaced:
                     case TradeEvent.Expired:
-                        if (_duplicationExecutionOrderIdByBrokerageOrderId.Remove(obj.Order.OrderId))
+                        if (_duplicationExecutionOrderIdByBrokerageOrderId.TryRemove(obj.Order.OrderId, out _))
                         {
                             if (newLeanOrderStatus == Orders.OrderStatus.UpdateSubmitted)
                             {
@@ -876,14 +916,37 @@ namespace QuantConnect.Brokerages.Alpaca
                             OnOrderEvent(statusEvent);
 
                             // Forward cancel/reject/expire events to BracketOrderManager for state tracking
-                            if (isBracketLeg || _bracketManager?.GetGroupIdForOrder(leanOrder.Id) != null)
+                            var groupId = isBracketLeg ? bracketLegInfo?.BracketGroupId : null;
+                            groupId ??= _bracketManager?.GetGroupIdForOrder(leanOrder.Id);
+                            if (groupId != null)
                             {
                                 _bracketManager?.ProcessOrderEvent(statusEvent);
+
+                                // Safety-net cleanup: when a bracket group becomes complete,
+                                // sweep provisional entries for any remaining legs of this group.
+                                // Normally each leg's cancel event triggers individual cleanup at
+                                // line 843, but if Alpaca fails to deliver a leg event, this
+                                // prevents a memory leak.
+                                var group = _bracketManager?.GetGroup(groupId);
+                                if (group != null && group.IsComplete && _provisionalBracketLegOrders.Count > 0)
+                                {
+                                    foreach (var kvp in _provisionalBracketLegOrders)
+                                    {
+                                        if (kvp.Value.Properties is AlpacaBracketOrderProperties props &&
+                                            props.BracketGroupId == groupId)
+                                        {
+                                            _provisionalBracketLegOrders.TryRemove(kvp.Key, out _);
+                                            Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                                $"Cleaned up stale provisional entry for completed group {groupId}, " +
+                                                $"AlpacaId={kvp.Key}");
+                                        }
+                                    }
+                                }
                             }
                         }
                         return;
                     case TradeEvent.Fill:
-                        if (_duplicationExecutionOrderIdByBrokerageOrderId.Remove(obj.Order.OrderId))
+                        if (_duplicationExecutionOrderIdByBrokerageOrderId.TryRemove(obj.Order.OrderId, out _))
                         {
                             if (isBracketLeg)
                             {
@@ -896,7 +959,11 @@ namespace QuantConnect.Brokerages.Alpaca
                         }
                         return;
                     case TradeEvent.PartialFill:
-                        if (_duplicationExecutionOrderIdByBrokerageOrderId[obj.Order.OrderId].Add(obj.ExecutionId.Value))
+                        // Use TryGetValue to guard against KeyNotFoundException: if a Fill
+                        // event already removed this order from the dedup map (e.g. a stale
+                        // PartialFill replayed after WebSocket reconnection), skip it.
+                        if (_duplicationExecutionOrderIdByBrokerageOrderId.TryGetValue(obj.Order.OrderId, out var execIds)
+                            && execIds.Add(obj.ExecutionId.Value))
                         {
                             if (isBracketLeg)
                             {
@@ -1030,6 +1097,13 @@ namespace QuantConnect.Brokerages.Alpaca
                         order.BrokerId.Add(brokerageOrderId);
                     }
 
+                    // Register the new brokerage ID in the deduplication map.
+                    // When update + cancel happen quickly, Alpaca may skip the
+                    // intermediate "replaced"/"new" events and only send "canceled"
+                    // for the replacement ID. Without this, the cancel event is
+                    // silently dropped because Remove() returns false.
+                    _duplicationExecutionOrderIdByBrokerageOrderId[response.OrderId] = [];
+
                     // --- Bracket leg: remap Alpaca order ID after PATCH ---
                     // Alpaca replaces the order, giving it a new ID. Update our tracking.
                     if (isBracketLeg && _bracketLegMapping.TryRemove(oldAlpacaGuid, out var oldLegInfo))
@@ -1081,6 +1155,56 @@ namespace QuantConnect.Brokerages.Alpaca
             }
             catch (Exception ex)
             {
+                // Alpaca rejects cancel on sibling bracket legs while another leg is mid-replace.
+                // Retry a few times with a brief delay to wait for the replace to complete.
+                if (ex.Message.Contains("pending replacement"))
+                {
+                    const int maxRetries = 3;
+                    const int retryDelayMs = 2000;
+                    for (var retry = 1; retry <= maxRetries; retry++)
+                    {
+                        Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(CancelOrder)}: " +
+                            $"Order {order.Id} pending replacement, retry {retry}/{maxRetries} in {retryDelayMs}ms");
+                        System.Threading.Thread.Sleep(retryDelayMs);
+
+                        if (order.Status is Orders.OrderStatus.Canceled or Orders.OrderStatus.Filled or Orders.OrderStatus.Invalid)
+                        {
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(CancelOrder)}: " +
+                                $"Order {order.Id} already {order.Status} after waiting, no cancel needed.");
+                            return true;
+                        }
+
+                        try
+                        {
+                            var retryResponse = false;
+                            _messageHandler.WithLockedStream(() =>
+                            {
+                                var brokerageOrderId = new Guid(order.BrokerId.Last());
+                                retryResponse = _tradingClient.CancelOrderAsync(brokerageOrderId).SynchronouslyAwaitTaskResult();
+                            });
+                            if (retryResponse)
+                            {
+                                Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(CancelOrder)}: " +
+                                    $"Order {order.Id} cancel succeeded on retry {retry}.");
+                                return true;
+                            }
+                        }
+                        catch (Exception retryEx)
+                        {
+                            if (!retryEx.Message.Contains("pending replacement"))
+                            {
+                                // Different error — fall through to emit Invalid
+                                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                                    $"Cancel order {order.Id} failed: {retryEx.Message}") { Status = Orders.OrderStatus.Invalid });
+                                return false;
+                            }
+                            // Same "pending replacement" error — continue retrying
+                        }
+                    }
+                    Log.Error($"{nameof(AlpacaBrokerage)}.{nameof(CancelOrder)}: " +
+                        $"Order {order.Id} cancel failed after {maxRetries} retries (pending replacement).");
+                }
+
                 OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, $"Cancel order {order.Id} failed: {ex.Message}") { Status = Orders.OrderStatus.Invalid });
                 return false;
             }

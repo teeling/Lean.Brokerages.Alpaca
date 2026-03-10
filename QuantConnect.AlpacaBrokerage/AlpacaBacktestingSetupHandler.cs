@@ -13,6 +13,7 @@
  * limitations under the License.
 */
 
+using QuantConnect.Brokerages.Backtesting;
 using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 using QuantConnect.Packets;
@@ -53,7 +54,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <returns>A new <see cref="AlpacaBacktestingBrokerage"/> instance.</returns>
         public override IBrokerage CreateBrokerage(AlgorithmNodePacket algorithmNodePacket, IAlgorithm uninitializedAlgorithm, out IBrokerageFactory factory)
         {
-            factory = null; // No factory needed for backtesting
+            factory = new BacktestingBrokerageFactory();
             Log.Debug("AlpacaBacktestingSetupHandler.CreateBrokerage: Creating AlpacaBacktestingBrokerage " +
                 "with bracket order support.");
             return new AlpacaBacktestingBrokerage(uninitializedAlgorithm);

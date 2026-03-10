@@ -18,6 +18,7 @@ using System.Linq;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using QuantConnect.Orders;
+using QuantConnect.Securities;
 using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 
@@ -137,31 +138,33 @@ namespace QuantConnect.Brokerages.Alpaca
                 OriginatingManager = this,
             };
 
-            // --- Place the entry order through LEAN's normal order API ---
-            // The brokerage intercepts this in PlaceOrder, detects the
-            // AlpacaBracketOrderProperties, and handles bracket creation.
-            OrderTicket entryTicket;
+            // --- Place the entry order through LEAN's SubmitOrderRequest API ---
+            // IAlgorithm exposes SubmitOrderRequest (not MarketOrder/LimitOrder which
+            // live on the concrete QCAlgorithm class). The brokerage intercepts this
+            // in PlaceOrder, detects the AlpacaBracketOrderProperties, and handles
+            // bracket creation.
+            var entryTag = string.IsNullOrEmpty(tag) ? $"bracket:{groupId}:entry" : tag;
+            SubmitOrderRequest request;
             switch (entryType)
             {
                 case OrderType.Market:
                     Log.Debug($"BracketOrderManager.PlaceBracketOrder: Placing market entry for group {groupId}");
-                    entryTicket = _algorithm.MarketOrder(symbol, quantity,
-                        tag: string.IsNullOrEmpty(tag) ? $"bracket:{groupId}:entry" : tag,
-                        orderProperties: props);
+                    request = new SubmitOrderRequest(OrderType.Market, symbol.SecurityType,
+                        symbol, quantity, 0, 0, _algorithm.UtcTime, entryTag, props);
                     break;
 
                 case OrderType.Limit:
                     Log.Debug($"BracketOrderManager.PlaceBracketOrder: Placing limit entry at {entryLimitPrice} for group {groupId}");
-                    entryTicket = _algorithm.LimitOrder(symbol, quantity,
-                        entryLimitPrice.Value,
-                        tag: string.IsNullOrEmpty(tag) ? $"bracket:{groupId}:entry" : tag,
-                        orderProperties: props);
+                    request = new SubmitOrderRequest(OrderType.Limit, symbol.SecurityType,
+                        symbol, quantity, 0, entryLimitPrice.Value, _algorithm.UtcTime, entryTag, props);
                     break;
 
                 default:
                     throw new NotSupportedException(
                         $"BracketOrderManager: Entry type {entryType} not supported. Use Market or Limit.");
             }
+
+            var entryTicket = _algorithm.SubmitOrderRequest(request);
 
             // --- Register the entry ticket with the group ---
             group.EntryTicket = entryTicket;
@@ -209,11 +212,36 @@ namespace QuantConnect.Brokerages.Alpaca
             }
             else
             {
-                // Cancel an active exit leg — brokerage handles OCO cascade
-                // (cancelling either leg causes the brokerage to cancel the sibling too)
-                var activeLeg = group.StopTicket?.Status.IsOpen() == true
-                    ? group.StopTicket
-                    : group.TargetTicket;
+                // Cancel an active exit leg — brokerage handles OCO cascade.
+                // IMPORTANT: If one leg has a pending Alpaca replace (update), we MUST
+                // cancel THAT leg, not the sibling. Alpaca locks sibling orders during
+                // a replace and rejects cancel attempts with "pending replacement".
+                // Cancelling the leg that is itself mid-replace is allowed by Alpaca.
+                OrderTicket activeLeg;
+                if (group.PendingUpdateOrderIds.Count > 0)
+                {
+                    // Prefer a leg that has a pending update — Alpaca allows cancelling
+                    // an order that is itself mid-replace, but rejects sibling cancels.
+                    activeLeg = null;
+                    if (group.StopTicket?.Status.IsOpen() == true &&
+                        group.PendingUpdateOrderIds.Contains(group.StopTicket.OrderId))
+                        activeLeg = group.StopTicket;
+                    else if (group.TargetTicket?.Status.IsOpen() == true &&
+                        group.PendingUpdateOrderIds.Contains(group.TargetTicket.OrderId))
+                        activeLeg = group.TargetTicket;
+
+                    // Fallback if the pending leg is already closed
+                    activeLeg ??= group.StopTicket?.Status.IsOpen() == true ? group.StopTicket : group.TargetTicket;
+
+                    Log.Debug($"BracketOrderManager.CancelBracket: Pending updates on orders [{string.Join(",", group.PendingUpdateOrderIds)}], " +
+                        $"preferring pending leg for cancel. Selected: {activeLeg?.OrderId}");
+                }
+                else
+                {
+                    activeLeg = group.StopTicket?.Status.IsOpen() == true
+                        ? group.StopTicket
+                        : group.TargetTicket;
+                }
 
                 if (activeLeg != null && activeLeg.Status.IsOpen())
                 {
@@ -270,6 +298,10 @@ namespace QuantConnect.Brokerages.Alpaca
                 fields.LimitPrice = newLimitPrice.Value;
             }
 
+            // Track that this leg has a pending replace so CancelBracket can
+            // avoid cancelling the sibling (Alpaca locks siblings during replace).
+            group.PendingUpdateOrderIds.Add(group.StopTicket.OrderId);
+
             var response = group.StopTicket.Update(fields);
 
             if (response.IsSuccess)
@@ -279,6 +311,7 @@ namespace QuantConnect.Brokerages.Alpaca
             }
             else
             {
+                group.PendingUpdateOrderIds.Remove(group.StopTicket.OrderId);
                 Log.Error($"BracketOrderManager.UpdateStop: Failed to update stop for group {groupId}. " +
                     $"Response: {response.ErrorCode} - {response.ErrorMessage}");
             }
@@ -318,6 +351,11 @@ namespace QuantConnect.Brokerages.Alpaca
                 $"from {group.TakeProfitPrice} to {newLimitPrice}");
 
             var fields = new UpdateOrderFields { LimitPrice = newLimitPrice };
+
+            // Track that this leg has a pending replace so CancelBracket can
+            // avoid cancelling the sibling (Alpaca locks siblings during replace).
+            group.PendingUpdateOrderIds.Add(group.TargetTicket.OrderId);
+
             var response = group.TargetTicket.Update(fields);
 
             if (response.IsSuccess)
@@ -327,6 +365,7 @@ namespace QuantConnect.Brokerages.Alpaca
             }
             else
             {
+                group.PendingUpdateOrderIds.Remove(group.TargetTicket.OrderId);
                 Log.Error($"BracketOrderManager.UpdateTarget: Failed to update target for group {groupId}. " +
                     $"Response: {response.ErrorCode} - {response.ErrorMessage}");
             }
@@ -429,19 +468,20 @@ namespace QuantConnect.Brokerages.Alpaca
             // Only process events for orders we're tracking
             if (!_orderToGroup.TryGetValue(e.OrderId, out var groupId))
             {
+                Log.Trace($"BracketOrderManager.ProcessOrderEvent: OrderId={e.OrderId} not in _orderToGroup (count={_orderToGroup.Count}). Ignoring.");
                 return;
             }
 
             if (!_groups.TryGetValue(groupId, out var group))
             {
-                Log.Error($"BracketOrderManager.OnOrderEvent: Group {groupId} found in _orderToGroup " +
+                Log.Error($"BracketOrderManager.ProcessOrderEvent: Group {groupId} found in _orderToGroup " +
                     $"but missing from _groups. OrderId={e.OrderId}, Status={e.Status}");
                 return;
             }
 
-            Log.Debug($"BracketOrderManager.OnOrderEvent: Group {groupId}, " +
+            Log.Trace($"BracketOrderManager.ProcessOrderEvent: Group {groupId}, " +
                 $"OrderId={e.OrderId}, Status={e.Status}, FillQty={e.FillQuantity}, " +
-                $"FillPrice={e.FillPrice}");
+                $"FillPrice={e.FillPrice}, EntryTicketId={group.EntryTicket?.OrderId ?? -1}");
 
             // --- Entry order events ---
             if (e.OrderId == group.EntryTicket?.OrderId)
@@ -477,6 +517,18 @@ namespace QuantConnect.Brokerages.Alpaca
                     Log.Debug($"BracketOrderManager.OnOrderEvent: Entry status update for group {groupId}: {e.Status}");
                 }
                 return;
+            }
+
+            // --- Clear pending update tracking ---
+            // When the update completes (UpdateSubmitted) or the order reaches any
+            // terminal/closed state, clear the pending flag so CancelBracket reverts
+            // to default leg selection.
+            if (group.PendingUpdateOrderIds.Contains(e.OrderId) &&
+                (e.Status == OrderStatus.UpdateSubmitted || e.Status.IsClosed()))
+            {
+                Log.Debug($"BracketOrderManager.ProcessOrderEvent: Clearing PendingUpdateOrderId={e.OrderId} " +
+                    $"for group {groupId} (status={e.Status})");
+                group.PendingUpdateOrderIds.Remove(e.OrderId);
             }
 
             // --- Exit leg events ---

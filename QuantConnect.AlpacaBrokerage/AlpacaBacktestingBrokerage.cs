@@ -129,6 +129,9 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         public override bool PlaceOrder(Order order)
         {
+            Log.Trace($"AlpacaBacktestingBrokerage.PlaceOrder: OrderId={order.Id}, Symbol={order.Symbol}, " +
+                $"Type={order.Type}, PropsType={order.Properties?.GetType().Name ?? "null"}");
+
             // Check if this is a bracket entry order
             if (order.Properties is AlpacaBracketOrderProperties props && props.IsBracketOrder)
             {
@@ -310,40 +313,55 @@ namespace QuantConnect.Brokerages.Alpaca
 
         /// <summary>
         /// Intercepts order events to detect bracket-related fills and cancellations.
-        /// When called from within Scan() (lock held), events are deferred.
-        /// When called from outside Scan(), events are processed immediately.
         ///
-        /// Also forwards bracket-related events to the BracketOrderManager for
-        /// state tracking (the manager does pure state tracking only).
+        /// IMPORTANT: We override OnOrderEvents (plural) because BacktestingBrokerage.Scan()
+        /// fires fill events via OnOrderEvents, NOT OnOrderEvent (singular). The singular
+        /// version in the base Brokerage class delegates to this method, so we catch all
+        /// events (fills, submitted, cancelled, etc.) in one place.
+        ///
+        /// When called from within Scan() (lock held), bracket events are deferred.
+        /// When called from outside Scan(), they are processed immediately.
+        /// Also forwards bracket-related events to the BracketOrderManager for state tracking.
         /// </summary>
-        protected override void OnOrderEvent(OrderEvent e)
+        protected override void OnOrderEvents(List<OrderEvent> orderEvents)
         {
-            // Always let the event propagate normally first
-            base.OnOrderEvent(e);
-
-            // Only process events for orders we're tracking in bracket groups
-            if (!_orderToGroup.ContainsKey(e.OrderId))
+            Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Called with {orderEvents.Count} events. " +
+                $"Tracked orders: {_orderToGroup.Count}");
+            foreach (var evt in orderEvents)
             {
-                return;
+                Log.Trace($"  Event: OrderId={evt.OrderId}, Status={evt.Status}, " +
+                    $"InTracking={_orderToGroup.ContainsKey(evt.OrderId)}");
             }
 
-            Log.Debug($"AlpacaBacktestingBrokerage.OnOrderEvent: Bracket-related event. " +
-                $"OrderId={e.OrderId}, Status={e.Status}, InBaseScan={_inBaseScan}");
+            // Let the events propagate normally first (fires OrdersStatusChanged)
+            base.OnOrderEvents(orderEvents);
 
-            // Forward to BracketOrderManager for state tracking
-            _manager?.ProcessOrderEvent(e);
+            // Process each event for bracket tracking
+            foreach (var e in orderEvents)
+            {
+                if (!_orderToGroup.ContainsKey(e.OrderId))
+                {
+                    continue;
+                }
 
-            if (_inBaseScan)
-            {
-                // Defer processing until after Scan() releases locks
-                _deferredBracketEvents.Enqueue(e);
-                Log.Debug($"AlpacaBacktestingBrokerage.OnOrderEvent: Deferred bracket event for " +
-                    $"OrderId={e.OrderId} Status={e.Status}");
-            }
-            else if (!_processingBracketEvent)
-            {
-                // Process immediately (e.g., from CancelOrder outside of Scan)
-                ProcessBracketEvent(e);
+                Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Bracket-related event. " +
+                    $"OrderId={e.OrderId}, Status={e.Status}, InBaseScan={_inBaseScan}");
+
+                // Forward to BracketOrderManager for state tracking
+                _manager?.ProcessOrderEvent(e);
+
+                if (_inBaseScan)
+                {
+                    // Defer processing until after Scan() releases locks
+                    _deferredBracketEvents.Enqueue(e);
+                    Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Deferred bracket event for " +
+                        $"OrderId={e.OrderId} Status={e.Status}");
+                }
+                else if (!_processingBracketEvent)
+                {
+                    // Process immediately (e.g., from CancelOrder outside of Scan)
+                    ProcessBracketEvent(e);
+                }
             }
         }
 
@@ -433,83 +451,94 @@ namespace QuantConnect.Brokerages.Alpaca
 
         /// <summary>
         /// Creates exit legs (stop-loss and take-profit) for a bracket group
-        /// after the entry order fills. Uses OnNewBrokerageOrderNotification
-        /// to create phantom LEAN orders that the engine will track.
+        /// after the entry order fills. Submits them through LEAN's normal order
+        /// pipeline via Algorithm.Transactions.AddOrder, so they are treated as
+        /// regular algorithm orders that flow through PlaceOrder for tracking.
         ///
         /// The exit quantity is the negative of the entry quantity
         /// (e.g., bought 100 → sell 100 for both stop and target).
         /// </summary>
         private void CreateExitLegs(BacktestBracketState state, OrderEvent entryFill)
         {
-            // Exit legs close the position, so quantity is negated
             var exitQty = -state.Quantity;
             var now = Algorithm.UtcTime;
 
-            Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Creating exit legs for group {state.GroupId}. " +
-                $"ExitQty={exitQty}, StopPrice={state.StopLossPrice}, TargetPrice={state.TakeProfitPrice}, " +
-                $"StopLimitPrice={state.StopLossLimitPrice}");
+            Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Creating exit legs for group {state.GroupId}. " +
+                $"ExitQty={exitQty}, StopPrice={state.StopLossPrice}, TargetPrice={state.TakeProfitPrice}");
+
+            // Update the manager's BracketGroup state directly. We can't rely on
+            // ProcessOrderEvent because BacktestingBrokerage fills market orders synchronously
+            // during AddOrder — the fill event fires before PlaceBracketOrder sets _orderToGroup.
+            if (_manager != null)
+            {
+                var group = _manager.GetGroup(state.GroupId);
+                if (group != null)
+                {
+                    group.EntryFilled = true;
+                    group.FillPrice = entryFill.FillPrice;
+                    group.FilledQuantity = Math.Abs(state.Quantity);
+                    Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Set EntryFilled=true on manager group. FillPrice={entryFill.FillPrice}");
+                }
+            }
 
             // --- Create stop-loss leg ---
-            Order stopOrder;
-            if (state.StopLossLimitPrice.HasValue)
-            {
-                // Stop-limit order
-                stopOrder = new StopLimitOrder(
-                    state.Symbol,
-                    exitQty,
-                    state.StopLossPrice,
-                    state.StopLossLimitPrice.Value,
-                    now,
-                    tag: $"bracket:{state.GroupId}:stop");
-
-                Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Created StopLimitOrder for stop leg. " +
-                    $"StopPrice={state.StopLossPrice}, LimitPrice={state.StopLossLimitPrice}");
-            }
-            else
-            {
-                // Stop-market order
-                stopOrder = new StopMarketOrder(
-                    state.Symbol,
-                    exitQty,
-                    state.StopLossPrice,
-                    now,
-                    tag: $"bracket:{state.GroupId}:stop");
-
-                Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Created StopMarketOrder for stop leg. " +
-                    $"StopPrice={state.StopLossPrice}");
-            }
-
-            // Tag with bracket group for identification in PlaceOrder
-            stopOrder.Properties = new AlpacaBracketOrderProperties
+            var stopProps = new AlpacaBracketOrderProperties
             {
                 BracketGroupId = state.GroupId,
                 LegType = BracketLegType.StopLoss
             };
 
-            // Submit as a brokerage-originated order that LEAN will track.
-            // The engine creates a proper LEAN order with an ID and calls our PlaceOrder.
-            Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Submitting stop leg via OnNewBrokerageOrderNotification for group {state.GroupId}");
-            OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(stopOrder));
+            SubmitOrderRequest stopRequest;
+            if (state.StopLossLimitPrice.HasValue)
+            {
+                stopRequest = new SubmitOrderRequest(
+                    OrderType.StopLimit,
+                    state.Symbol.SecurityType,
+                    state.Symbol,
+                    exitQty,
+                    state.StopLossPrice,
+                    state.StopLossLimitPrice.Value,
+                    now,
+                    $"bracket:{state.GroupId}:stop",
+                    stopProps);
+            }
+            else
+            {
+                stopRequest = new SubmitOrderRequest(
+                    OrderType.StopMarket,
+                    state.Symbol.SecurityType,
+                    state.Symbol,
+                    exitQty,
+                    state.StopLossPrice,
+                    0m,
+                    now,
+                    $"bracket:{state.GroupId}:stop",
+                    stopProps);
+            }
+
+            var stopTicket = Algorithm.Transactions.AddOrder(stopRequest);
+            Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Stop leg submitted. OrderId={stopTicket.OrderId}, Status={stopTicket.Status}");
 
             // --- Create take-profit leg ---
-            var targetOrder = new LimitOrder(
-                state.Symbol,
-                exitQty,
-                state.TakeProfitPrice,
-                now,
-                tag: $"bracket:{state.GroupId}:target");
-
-            targetOrder.Properties = new AlpacaBracketOrderProperties
+            var targetProps = new AlpacaBracketOrderProperties
             {
                 BracketGroupId = state.GroupId,
                 LegType = BracketLegType.TakeProfit
             };
 
-            Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Submitting target leg via OnNewBrokerageOrderNotification for group {state.GroupId}");
-            OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(targetOrder));
+            var targetRequest = new SubmitOrderRequest(
+                OrderType.Limit,
+                state.Symbol.SecurityType,
+                state.Symbol,
+                exitQty,
+                0m,
+                state.TakeProfitPrice,
+                now,
+                $"bracket:{state.GroupId}:target",
+                targetProps);
 
-            Log.Debug($"AlpacaBacktestingBrokerage.CreateExitLegs: Both exit legs submitted for group {state.GroupId}. " +
-                $"They will be placed on the next Scan() cycle.");
+            var targetTicket = Algorithm.Transactions.AddOrder(targetRequest);
+            Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Target leg submitted. OrderId={targetTicket.OrderId}, Status={targetTicket.Status}");
         }
 
         #endregion

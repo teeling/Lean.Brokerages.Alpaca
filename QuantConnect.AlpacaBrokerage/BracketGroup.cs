@@ -13,6 +13,7 @@
  * limitations under the License.
 */
 
+using System.Collections.Generic;
 using QuantConnect.Orders;
 
 namespace QuantConnect.Brokerages.Alpaca
@@ -106,6 +107,17 @@ namespace QuantConnect.Brokerages.Alpaca
         /// True if the bracket is fully resolved (either an exit filled or the bracket was cancelled).
         /// </summary>
         public bool IsComplete => ExitFilled || IsCancelled;
+
+        /// <summary>
+        /// LEAN order IDs of legs currently undergoing an Alpaca replace (update).
+        /// Populated by BracketOrderManager when UpdateStop/UpdateTarget is called,
+        /// entries removed when the UpdateSubmitted or terminal event arrives.
+        /// Used by CancelBracket to avoid cancelling the sibling of a mid-replace leg
+        /// (Alpaca rejects sibling cancels during a replace with "pending replacement").
+        /// A HashSet supports concurrent updates to both legs (e.g. UpdateStop then
+        /// UpdateTarget in rapid succession).
+        /// </summary>
+        internal readonly HashSet<int> PendingUpdateOrderIds = new();
 
         /// <summary>
         /// Actual entry fill price. Set when the entry order fills.
