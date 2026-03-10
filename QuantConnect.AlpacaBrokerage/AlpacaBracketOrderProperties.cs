@@ -62,6 +62,15 @@ namespace QuantConnect.Brokerages.Alpaca
         public BracketLegType? LegType { get; set; }
 
         /// <summary>
+        /// Reference to the BracketOrderManager that created this bracket order.
+        /// Set on bracket entry orders by the manager; used by the brokerage to
+        /// auto-register itself with the manager on the first bracket order.
+        /// This avoids requiring the user to manually wire the manager to the brokerage
+        /// (IAlgorithm does not expose a BrokerageInstance property).
+        /// </summary>
+        internal BracketOrderManager OriginatingManager { get; set; }
+
+        /// <summary>
         /// True if this is a bracket entry order (has all required bracket prices).
         /// False for bracket leg orders or non-bracket orders.
         /// </summary>

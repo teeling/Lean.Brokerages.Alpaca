@@ -338,7 +338,15 @@ namespace QuantConnect.Brokerages.Alpaca
         private bool TryConvertToLeanOrder(IOrder brokerageOrder, out Order leanOrder)
         {
             leanOrder = null;
-            if (brokerageOrder.Legs.Count > 1)
+
+            // Bracket parent orders have Legs pointing to child stop/target orders.
+            // Convert the parent as its base order type (Market/Limit) — the bracket
+            // legs are tracked separately by BracketOrderManager and the brokerage.
+            // Only reject true multi-leg option orders (ComboMarket/ComboLimit).
+            if (brokerageOrder.Legs.Count > 1
+                && brokerageOrder.OrderClass != AlpacaMarket.OrderClass.Bracket
+                && brokerageOrder.OrderClass != AlpacaMarket.OrderClass.OneCancelsOther
+                && brokerageOrder.OrderClass != AlpacaMarket.OrderClass.OneTriggersOther)
             {
                 // TODO: Implement OrderType.ComboMarket and OrderType.ComboLimit
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NotSupportedOrderType", "Multi-leg orders are not currently supported."));
@@ -463,6 +471,14 @@ namespace QuantConnect.Brokerages.Alpaca
                     // --- Check for bracket order ---
                     if (order.Properties is AlpacaBracketOrderProperties bracketProps && bracketProps.IsBracketOrder)
                     {
+                        // Auto-register with the BracketOrderManager on first bracket order.
+                        // IAlgorithm doesn't expose BrokerageInstance, so we use the order
+                        // properties as a bridge for manager ↔ brokerage discovery.
+                        if (_bracketManager == null && bracketProps.OriginatingManager != null)
+                        {
+                            RegisterManager(bracketProps.OriginatingManager);
+                        }
+
                         Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOrder: Detected bracket entry order. " +
                             $"OrderId={order.Id}, GroupId={bracketProps.BracketGroupId}, " +
                             $"Symbol={order.Symbol}, Qty={order.Quantity}, " +

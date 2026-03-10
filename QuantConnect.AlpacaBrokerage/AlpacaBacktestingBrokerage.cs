@@ -44,6 +44,14 @@ namespace QuantConnect.Brokerages.Alpaca
     /// _needsScanLock is held. We queue bracket-related events and process them after
     /// base.Scan() returns and the lock is released. This avoids deadlocks from
     /// calling PlaceOrder/CancelOrder (which also acquire the lock) during event handling.
+    ///
+    /// Known limitations:
+    /// - Partial fills: Alpaca adjusts the sibling leg quantity on partial fills (e.g.,
+    ///   target partial fill → reduce stop quantity). This is not modeled in backtesting;
+    ///   exit legs use the full entry quantity. In live trading, Alpaca handles this natively.
+    /// - UpdateOrder: Stop/target price updates go through base.UpdateOrder which handles
+    ///   standard stop/limit updates. No bracket-specific update override is needed since
+    ///   the exit legs are standard StopMarket/LimitOrder objects.
     /// </summary>
     public class AlpacaBacktestingBrokerage : BacktestingBrokerage
     {
@@ -54,6 +62,11 @@ namespace QuantConnect.Brokerages.Alpaca
 
         /// <summary>
         /// Maps LEAN order ID → bracket group ID for fast lookup during event processing.
+        /// Note: BracketOrderManager also maintains its own _orderToGroup for event routing.
+        /// Both are populated through their respective PlaceOrder/RegisterLegTicket paths
+        /// and should stay in sync. The duplication is intentional: the brokerage needs
+        /// this mapping for OCO cascade logic (which runs before/independently of the manager),
+        /// while the manager needs it for state tracking in ProcessOrderEvent.
         /// </summary>
         private readonly ConcurrentDictionary<int, string> _orderToGroup = new();
 
@@ -61,8 +74,9 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Bracket-related order events that need to be processed after Scan() releases locks.
         /// Events are queued during OnOrderEvent (called within locked Scan) and processed
         /// in our Scan() override after base.Scan() returns.
+        /// Uses ConcurrentQueue for thread safety, consistent with other concurrent collections here.
         /// </summary>
-        private readonly Queue<OrderEvent> _deferredBracketEvents = new();
+        private readonly ConcurrentQueue<OrderEvent> _deferredBracketEvents = new();
 
         /// <summary>
         /// Flag indicating we're currently inside base.Scan() processing.
@@ -118,6 +132,14 @@ namespace QuantConnect.Brokerages.Alpaca
             // Check if this is a bracket entry order
             if (order.Properties is AlpacaBracketOrderProperties props && props.IsBracketOrder)
             {
+                // Auto-register with the BracketOrderManager on first bracket order.
+                // This bridges the gap where IAlgorithm doesn't expose BrokerageInstance,
+                // so the manager can't discover us during construction.
+                if (_manager == null && props.OriginatingManager != null)
+                {
+                    RegisterManager(props.OriginatingManager);
+                }
+
                 Log.Debug($"AlpacaBacktestingBrokerage.PlaceOrder: Detected bracket entry order. " +
                     $"OrderId={order.Id}, GroupId={props.BracketGroupId}, Symbol={order.Symbol}, " +
                     $"Qty={order.Quantity}, Stop={props.StopLossStopPrice}, Target={props.TakeProfitLimitPrice}, " +
@@ -211,6 +233,13 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Intercepts cancel requests for bracket orders.
         /// Cancelling one leg automatically cancels the sibling (OCO behavior).
         /// Cancelling the entry cancels any existing legs.
+        ///
+        /// Note on OCO flow: When a leg is cancelled here, the sibling is cancelled
+        /// explicitly via CancelLegIfOpen. The resulting cancel OrderEvent for the
+        /// sibling will hit OnOrderEvent → ProcessBracketEvent, but ProcessBracketEvent
+        /// only acts on fills and entry cancels — it does NOT re-cascade leg cancels.
+        /// This is intentional: CancelOrder handles the OCO cascade directly, so
+        /// ProcessBracketEvent doesn't need to duplicate that logic.
         /// </summary>
         public override bool CancelOrder(Order order)
         {
@@ -322,9 +351,8 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         private void ProcessDeferredBracketEvents()
         {
-            while (_deferredBracketEvents.Count > 0)
+            while (_deferredBracketEvents.TryDequeue(out var e))
             {
-                var e = _deferredBracketEvents.Dequeue();
                 Log.Debug($"AlpacaBacktestingBrokerage.ProcessDeferredBracketEvents: Processing deferred event " +
                     $"OrderId={e.OrderId}, Status={e.Status}");
                 ProcessBracketEvent(e);

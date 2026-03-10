@@ -134,6 +134,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 TakeProfitLimitPrice = takeProfitPrice,
                 StopLossStopPrice = stopLossPrice,
                 StopLossLimitPrice = stopLossLimitPrice,
+                OriginatingManager = this,
             };
 
             // --- Place the entry order through LEAN's normal order API ---
@@ -196,7 +197,9 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Debug($"BracketOrderManager.CancelBracket: Cancelling group {groupId}. " +
                 $"EntryFilled={group.EntryFilled}");
 
-            group.IsCancelled = true;
+            // Do NOT set IsCancelled here eagerly — it will be set by ProcessOrderEvent
+            // when the actual Canceled OrderEvent arrives from the brokerage. Setting it
+            // eagerly would cause IsComplete to return true even if the cancel is rejected.
 
             if (!group.EntryFilled)
             {
