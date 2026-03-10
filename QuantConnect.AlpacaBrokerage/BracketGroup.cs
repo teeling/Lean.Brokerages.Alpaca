@@ -39,9 +39,16 @@ namespace QuantConnect.Brokerages.Alpaca
         public Symbol Symbol { get; }
 
         /// <summary>
-        /// Signed entry quantity. Positive for long brackets, negative for short brackets.
+        /// Signed entry quantity requested. Positive for long brackets, negative for short brackets.
         /// </summary>
         public decimal Quantity { get; }
+
+        /// <summary>
+        /// Accumulative signed fill quantity of the entry order so far.
+        /// For partial fills this will be less than <see cref="Quantity"/> until fully filled.
+        /// In live trading, Alpaca adjusts exit leg quantities to match this value.
+        /// </summary>
+        public decimal FilledQuantity { get; internal set; }
 
         /// <summary>
         /// Current stop-loss trigger price. May be updated via UpdateStop().
@@ -149,7 +156,9 @@ namespace QuantConnect.Brokerages.Alpaca
             var status = IsComplete
                 ? (ExitFilled ? $"ExitFilled(orderId={ExitOrderId}, price={ExitPrice})" : "Cancelled")
                 : (EntryFilled ? "Active(entry filled, waiting for exit)" : "Pending(entry not filled)");
-            return $"BracketGroup[{GroupId}] {Symbol} qty={Quantity} stop={StopLossPrice} target={TakeProfitPrice} status={status}";
+            var qtyInfo = FilledQuantity != 0 && FilledQuantity != Quantity
+                ? $"qty={FilledQuantity}/{Quantity}" : $"qty={Quantity}";
+            return $"BracketGroup[{GroupId}] {Symbol} {qtyInfo} stop={StopLossPrice} target={TakeProfitPrice} status={status}";
         }
     }
 }

@@ -291,11 +291,18 @@ namespace QuantConnect.Brokerages.Alpaca
             // Step 1: Mark that we're inside base.Scan() so bracket events get deferred
             _inBaseScan = true;
 
-            // Step 2: Run the normal scan — this evaluates fills and fires OnOrderEvent
-            base.Scan();
-
-            // Step 3: We're out of the locked scan — safe to call PlaceOrder/CancelOrder
-            _inBaseScan = false;
+            try
+            {
+                // Step 2: Run the normal scan — this evaluates fills and fires OnOrderEvent
+                base.Scan();
+            }
+            finally
+            {
+                // Step 3: Always clear the flag, even if base.Scan() throws.
+                // If this isn't cleared, all subsequent bracket events would be
+                // queued forever and never processed (silent failure).
+                _inBaseScan = false;
+            }
 
             // Step 4: Process any bracket events that were deferred during the scan
             ProcessDeferredBracketEvents();

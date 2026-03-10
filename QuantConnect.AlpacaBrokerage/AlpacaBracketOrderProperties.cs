@@ -13,6 +13,7 @@
  * limitations under the License.
 */
 
+using Newtonsoft.Json;
 using QuantConnect.Orders;
 
 namespace QuantConnect.Brokerages.Alpaca
@@ -68,6 +69,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// This avoids requiring the user to manually wire the manager to the brokerage
         /// (IAlgorithm does not expose a BrokerageInstance property).
         /// </summary>
+        [JsonIgnore]
         internal BracketOrderManager OriginatingManager { get; set; }
 
         /// <summary>

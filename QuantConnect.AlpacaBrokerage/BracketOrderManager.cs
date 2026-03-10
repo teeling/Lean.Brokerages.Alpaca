@@ -449,9 +449,22 @@ namespace QuantConnect.Brokerages.Alpaca
                 if (e.Status == OrderStatus.Filled)
                 {
                     group.EntryFilled = true;
+                    group.FilledQuantity += e.FillQuantity;
                     group.FillPrice = e.FillPrice;
                     Log.Debug($"BracketOrderManager.OnOrderEvent: Entry FILLED for group {groupId} " +
-                        $"at price {e.FillPrice}. Waiting for brokerage to create exit legs.");
+                        $"at price {e.FillPrice}. FilledQty={group.FilledQuantity}/{group.Quantity}. " +
+                        $"Waiting for brokerage to create exit legs.");
+                }
+                else if (e.Status == OrderStatus.PartiallyFilled)
+                {
+                    // Track cumulative fill quantity. In live trading, Alpaca automatically
+                    // adjusts exit leg quantities to match the filled entry quantity.
+                    // We track this so the algorithm can see accurate state.
+                    group.FilledQuantity += e.FillQuantity;
+                    group.FillPrice = e.FillPrice;
+                    Log.Debug($"BracketOrderManager.OnOrderEvent: Entry PARTIAL FILL for group {groupId} " +
+                        $"at price {e.FillPrice}. FilledQty={group.FilledQuantity}/{group.Quantity}. " +
+                        $"Alpaca will adjust exit leg quantities to match.");
                 }
                 else if (e.Status == OrderStatus.Canceled || e.Status == OrderStatus.Invalid)
                 {
@@ -477,6 +490,16 @@ namespace QuantConnect.Brokerages.Alpaca
                 Log.Debug($"BracketOrderManager.OnOrderEvent: {legName} leg FILLED for group {groupId} " +
                     $"at price {e.FillPrice}. Bracket is now complete. " +
                     $"Brokerage should cancel the sibling leg (OCO).");
+            }
+            else if (e.Status == OrderStatus.PartiallyFilled)
+            {
+                // In live trading, Alpaca handles partial exit fills by adjusting the
+                // sibling leg quantity. We log this for visibility but don't mark ExitFilled
+                // until we get the final Filled event.
+                var legName = (e.OrderId == group.StopTicket?.OrderId) ? "STOP" : "TARGET";
+                Log.Debug($"BracketOrderManager.OnOrderEvent: {legName} leg PARTIAL FILL for group {groupId} " +
+                    $"at price {e.FillPrice}. FillQty={e.FillQuantity}. " +
+                    $"Alpaca will adjust sibling leg quantity accordingly.");
             }
             else if (e.Status == OrderStatus.Canceled)
             {

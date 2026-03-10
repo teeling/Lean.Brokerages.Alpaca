@@ -321,7 +321,14 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <returns>The open orders returned from IB</returns>
         public override List<Order> GetOpenOrders()
         {
-            var orders = _tradingClient.ListOrdersAsync(new ListOrdersRequest() { OrderStatusFilter = OrderStatusFilter.Open }).SynchronouslyAwaitTaskResult();
+            // RollUpNestedOrders groups bracket/OCO/OTO child orders under the parent's
+            // Legs property, giving us the full parent→child structure needed to
+            // reconstruct bracket groups after a restart or reconciliation pass.
+            var orders = _tradingClient.ListOrdersAsync(new ListOrdersRequest()
+            {
+                OrderStatusFilter = OrderStatusFilter.Open,
+                RollUpNestedOrders = true,
+            }).SynchronouslyAwaitTaskResult();
 
             var leanOrders = new List<Order>();
             foreach (var brokerageOrder in orders)
