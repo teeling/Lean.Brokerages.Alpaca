@@ -333,9 +333,72 @@ namespace QuantConnect.Brokerages.Alpaca
             var leanOrders = new List<Order>();
             foreach (var brokerageOrder in orders)
             {
-                if (TryConvertToLeanOrder(brokerageOrder, out var leanOrder))
+                if (!TryConvertToLeanOrder(brokerageOrder, out var leanOrder))
                 {
-                    leanOrders.Add(leanOrder);
+                    continue;
+                }
+
+                leanOrders.Add(leanOrder);
+
+                // Bracket parents have legs nested under them with RollUpNestedOrders.
+                // We need to flatten them into separate top-level LEAN orders so LEAN's
+                // reconciliation can track each leg independently. Also register the
+                // leg mappings so HandleTradeUpdate can route events correctly.
+                if (brokerageOrder.OrderClass == AlpacaMarket.OrderClass.Bracket
+                    && brokerageOrder.Legs.Count > 0)
+                {
+                    // Use the Alpaca parent order ID as a recovery group ID.
+                    // The original BracketOrderManager group ID is lost on restart
+                    // (it's in-memory only), so we derive one from the parent.
+                    var recoveryGroupId = $"recovery:{brokerageOrder.OrderId}";
+
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Bracket parent " +
+                        $"AlpacaId={brokerageOrder.OrderId} has {brokerageOrder.Legs.Count} legs. " +
+                        $"Flattening for reconciliation. RecoveryGroupId={recoveryGroupId}");
+
+                    foreach (var leg in brokerageOrder.Legs)
+                    {
+                        if (!TryConvertToLeanOrder(leg, out var legLeanOrder))
+                        {
+                            Log.Error($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Failed to convert bracket leg " +
+                                $"AlpacaId={leg.OrderId} for parent {brokerageOrder.OrderId}");
+                            continue;
+                        }
+
+                        // Determine leg type from Alpaca order type
+                        var legType = leg.OrderType switch
+                        {
+                            AlpacaMarket.OrderType.Limit => BracketLegType.TakeProfit,
+                            AlpacaMarket.OrderType.Stop => BracketLegType.StopLoss,
+                            AlpacaMarket.OrderType.StopLimit => BracketLegType.StopLoss,
+                            _ => (BracketLegType?)null
+                        };
+
+                        if (legType.HasValue)
+                        {
+                            // Tag with bracket properties for identification
+                            legLeanOrder.Properties = new AlpacaBracketOrderProperties
+                            {
+                                BracketGroupId = recoveryGroupId,
+                                LegType = legType.Value
+                            };
+
+                            // Register in _bracketLegMapping so HandleTradeUpdate can
+                            // route subsequent trade events for these legs correctly
+                            _bracketLegMapping.TryAdd(leg.OrderId, new BracketLegInfo
+                            {
+                                BracketGroupId = recoveryGroupId,
+                                AlpacaLegOrderId = leg.OrderId,
+                                LegType = legType.Value,
+                            });
+
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Flattened bracket leg " +
+                                $"AlpacaId={leg.OrderId}, Type={legType}, " +
+                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}");
+                        }
+
+                        leanOrders.Add(legLeanOrder);
+                    }
                 }
             }
 
