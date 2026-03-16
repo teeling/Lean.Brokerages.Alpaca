@@ -64,6 +64,13 @@ namespace QuantConnect.Brokerages.Alpaca
         private readonly ConcurrentDictionary<int, string> _orderToGroup = new();
 
         /// <summary>
+        /// Pending partial-fill rescues. Maps old (cancelled) group ID to rescue state.
+        /// Populated by <see cref="RescuePartialFill"/>, consumed by <see cref="CheckPendingRescue"/>
+        /// when all old bracket orders are confirmed canceled.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, PendingRescue> _pendingRescues = new();
+
+        /// <summary>
         /// Creates a new BracketOrderManager.
         /// The algorithm should create this in Initialize() and store it as a field.
         ///
@@ -501,6 +508,159 @@ namespace QuantConnect.Brokerages.Alpaca
             return response.IsSuccess;
         }
 
+        /// <summary>
+        /// Rescues a partially-filled bracket by canceling it and replacing it with an
+        /// OCO order to protect the filled position.
+        ///
+        /// Returns a new BracketGroup immediately. The OCO order will be placed
+        /// automatically once Alpaca confirms all old bracket orders are canceled.
+        /// During the gap, the group has no StopTicket/TargetTicket — but EntryFilled
+        /// is true, so normal strategy logic (which returns early for filled entries)
+        /// is unaffected.
+        ///
+        /// The strategy should store the returned group in _active_brackets[symbol].
+        /// When the OCO eventually fills (stop or target), the group transitions to
+        /// IsComplete and the normal on_order_event cleanup fires.
+        /// </summary>
+        /// <param name="oldGroupId">The group ID of the partially-filled bracket to rescue.</param>
+        /// <returns>A new BracketGroup representing the OCO protection, or null if rescue is not applicable.</returns>
+        public BracketGroup RescuePartialFill(string oldGroupId)
+        {
+            if (!_groups.TryGetValue(oldGroupId, out var oldGroup))
+            {
+                Log.Error($"BracketOrderManager.RescuePartialFill: Group {oldGroupId} not found.");
+                return null;
+            }
+
+            if (oldGroup.FilledQuantity <= 0)
+            {
+                Log.Error($"BracketOrderManager.RescuePartialFill: Group {oldGroupId} has no partial fills. Use CancelBracket instead.");
+                return null;
+            }
+
+            if (oldGroup.EntryFilled)
+            {
+                Log.Error($"BracketOrderManager.RescuePartialFill: Group {oldGroupId} entry is fully filled. No rescue needed.");
+                return null;
+            }
+
+            // Create the new OCO group immediately (pre-populated, no tickets yet)
+            var newGroupId = Guid.NewGuid().ToString("N");
+            var exitQty = -Math.Abs(oldGroup.FilledQuantity);  // Sell quantity
+
+            var newGroup = new BracketGroup(
+                newGroupId,
+                oldGroup.Symbol,
+                exitQty,
+                oldGroup.StopLossPrice,
+                oldGroup.TakeProfitPrice,
+                oldGroup.StopLossLimitPrice,
+                entryType: OrderType.Market  // Not used for OCO, but required by constructor
+            );
+            newGroup.EntryFilled = true;
+            newGroup.FillPrice = oldGroup.FillPrice;
+            newGroup.FilledQuantity = Math.Abs(oldGroup.FilledQuantity);
+
+            _groups[newGroupId] = newGroup;
+
+            // Register the pending rescue
+            _pendingRescues[oldGroupId] = new PendingRescue
+            {
+                Symbol = oldGroup.Symbol,
+                FilledQuantity = Math.Abs(oldGroup.FilledQuantity),
+                StopLossPrice = oldGroup.StopLossPrice,
+                TakeProfitPrice = oldGroup.TakeProfitPrice,
+                StopLossLimitPrice = oldGroup.StopLossLimitPrice,
+                FillPrice = oldGroup.FillPrice ?? 0m,
+                NewGroup = newGroup,
+                RequestedAt = DateTime.UtcNow,
+            };
+
+            Log.Debug($"BracketOrderManager.RescuePartialFill: Rescue registered for group {oldGroupId}. " +
+                $"New group {newGroupId}. Cancelling old bracket, OCO will be placed on cancel confirmation.");
+
+            // Cancel the old bracket — this triggers the cascade
+            CancelBracket(oldGroupId);
+
+            return newGroup;
+        }
+
+        /// <summary>
+        /// Places a standalone OCO order: a take-profit limit + stop-loss, linked
+        /// so that when one fills Alpaca cancels the other.
+        ///
+        /// Unlike <see cref="PlaceBracketOrder"/>, there is no entry order. The BracketGroup is
+        /// created with EntryFilled = true.
+        /// </summary>
+        /// <param name="symbol">The symbol to trade.</param>
+        /// <param name="quantity">Signed exit quantity. Negative for selling (closing a long).</param>
+        /// <param name="stopLossPrice">Stop-loss trigger price.</param>
+        /// <param name="takeProfitPrice">Take-profit limit price.</param>
+        /// <param name="fillPrice">The entry fill price (for PnL tracking).</param>
+        /// <param name="filledQuantity">The position size being protected (positive).</param>
+        /// <param name="stopLossLimitPrice">Optional: makes the stop-loss a stop-limit.</param>
+        /// <returns>A BracketGroup for tracking the OCO lifecycle.</returns>
+        public BracketGroup PlaceOcoOrder(
+            Symbol symbol,
+            decimal quantity,
+            decimal stopLossPrice,
+            decimal takeProfitPrice,
+            decimal fillPrice,
+            decimal filledQuantity,
+            decimal? stopLossLimitPrice = null)
+        {
+            // Round prices
+            stopLossPrice   = RoundPrice(stopLossPrice, "ocoStop");
+            takeProfitPrice = RoundPrice(takeProfitPrice, "ocoTarget");
+            if (stopLossLimitPrice.HasValue)
+                stopLossLimitPrice = RoundPrice(stopLossLimitPrice.Value, "ocoStopLimit");
+
+            // Validate
+            if (symbol == null)
+                throw new ArgumentException("BracketOrderManager.PlaceOcoOrder: Symbol cannot be null.");
+            if (quantity == 0)
+                throw new ArgumentException("BracketOrderManager.PlaceOcoOrder: Quantity cannot be zero.");
+            if (takeProfitPrice <= stopLossPrice)
+                throw new ArgumentException(
+                    $"BracketOrderManager.PlaceOcoOrder: takeProfitPrice ({takeProfitPrice}) must be > stopLossPrice ({stopLossPrice}).");
+
+            var groupId = Guid.NewGuid().ToString("N");
+            var group = new BracketGroup(
+                groupId, symbol, quantity,
+                stopLossPrice, takeProfitPrice, stopLossLimitPrice,
+                entryType: OrderType.Market  // Not used for OCO
+            );
+            group.EntryFilled = true;
+            group.FillPrice = fillPrice;
+            group.FilledQuantity = Math.Abs(filledQuantity);
+
+            _groups[groupId] = group;
+
+            // Submit the OCO
+            ExecuteOcoSubmission(group);
+
+            return group;
+        }
+
+        /// <summary>
+        /// Checks for stale pending rescues and logs warnings.
+        /// Called periodically from the strategy (e.g., from on_minute_bar).
+        /// </summary>
+        /// <param name="currentTime">Current UTC time.</param>
+        /// <param name="maxAge">Maximum allowed age for a pending rescue before warning.</param>
+        public void CheckStalePendingRescues(DateTime currentTime, TimeSpan maxAge)
+        {
+            foreach (var kvp in _pendingRescues)
+            {
+                if (currentTime - kvp.Value.RequestedAt > maxAge)
+                {
+                    Log.Error($"BracketOrderManager: Pending rescue for group {kvp.Key} " +
+                        $"has been waiting {currentTime - kvp.Value.RequestedAt}. " +
+                        $"Cancel confirmation may have been lost. Symbol={kvp.Value.Symbol}");
+                }
+            }
+        }
+
         #endregion
 
         #region Query Methods
@@ -625,14 +785,16 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
                 else if (e.Status == OrderStatus.PartiallyFilled)
                 {
-                    // Track cumulative fill quantity. In live trading, Alpaca automatically
-                    // adjusts exit leg quantities to match the filled entry quantity.
-                    // We track this so the algorithm can see accurate state.
+                    // Track cumulative fill quantity. Note: for bracket orders with stop-limit
+                    // entries, Alpaca keeps exit legs in "held" status until the entry fully
+                    // fills — partial fills do NOT activate the exit legs. The position is
+                    // unprotected during partial fills. See RescuePartialFill() for the
+                    // mitigation strategy.
                     group.FilledQuantity += e.FillQuantity;
                     group.FillPrice = e.FillPrice;
                     Log.Debug($"BracketOrderManager.OnOrderEvent: Entry PARTIAL FILL for group {groupId} " +
                         $"at price {e.FillPrice}. FilledQty={group.FilledQuantity}/{group.Quantity}. " +
-                        $"Alpaca will adjust exit leg quantities to match.");
+                        $"Exit legs may still be in 'held' status (unprotected).");
                 }
                 else if (e.Status == OrderStatus.Canceled || e.Status == OrderStatus.Invalid)
                 {
@@ -682,6 +844,9 @@ namespace QuantConnect.Brokerages.Alpaca
                         }
                     }
                 }
+
+                // --- Check if this entry event completes a pending rescue ---
+                CheckPendingRescue(groupId, group);
 
                 return;
             }
@@ -743,6 +908,9 @@ namespace QuantConnect.Brokerages.Alpaca
                 var legName = (e.OrderId == group.StopTicket?.OrderId) ? "STOP" : "TARGET";
                 Log.Debug($"BracketOrderManager.OnOrderEvent: {legName} leg status update for group {groupId}: {e.Status}");
             }
+
+            // --- Check if this exit leg event completes a pending rescue ---
+            CheckPendingRescue(groupId, group);
         }
 
         #endregion
@@ -832,6 +1000,107 @@ namespace QuantConnect.Brokerages.Alpaca
                     $"(Alpaca max {maxDecimals} decimal places).");
             }
             return rounded;
+        }
+
+        #endregion
+
+        #region OCO Rescue Internals
+
+        /// <summary>
+        /// Checks whether all orders in an old bracket group are confirmed closed,
+        /// completing a pending rescue. If so, places the OCO order.
+        /// Called from <see cref="ProcessOrderEvent"/> for both entry and exit leg events.
+        /// </summary>
+        private void CheckPendingRescue(string groupId, BracketGroup group)
+        {
+            if (!_pendingRescues.TryGetValue(groupId, out var rescue))
+                return;
+
+            var allClosed =
+                (group.EntryTicket == null || group.EntryTicket.Status.IsClosed()) &&
+                (group.StopTicket == null || group.StopTicket.Status.IsClosed()) &&
+                (group.TargetTicket == null || group.TargetTicket.Status.IsClosed());
+
+            if (allClosed)
+            {
+                Log.Debug($"BracketOrderManager: All orders confirmed closed for rescue {groupId}. Placing OCO.");
+                _pendingRescues.TryRemove(groupId, out _);
+                ExecuteOcoSubmission(rescue.NewGroup);
+            }
+        }
+
+        /// <summary>
+        /// Submits the OCO order for a BracketGroup through LEAN's order pipeline.
+        /// The primary leg (limit sell = take-profit) is submitted as a standard LEAN
+        /// Limit order with <see cref="AlpacaOcoOrderProperties"/>. The brokerage
+        /// detects these properties and calls <c>.OneCancelsOther()</c> on the Alpaca SDK.
+        /// The stop leg is created by the brokerage as a phantom LEAN order.
+        /// </summary>
+        private void ExecuteOcoSubmission(BracketGroup group)
+        {
+            var targetPrice = RoundPrice(group.TakeProfitPrice, "ocoTarget");
+            var stopPrice = RoundPrice(group.StopLossPrice, "ocoStop");
+
+            var props = new AlpacaOcoOrderProperties
+            {
+                OcoGroupId = group.GroupId,
+                StopLossStopPrice = stopPrice,
+                StopLossLimitPrice = group.StopLossLimitPrice.HasValue
+                    ? RoundPrice(group.StopLossLimitPrice.Value, "ocoStopLimit")
+                    : null,
+                OriginatingManager = this,
+            };
+
+            // Submit the primary leg (limit sell at target price) through LEAN
+            var exitQty = -Math.Abs(group.FilledQuantity);
+            var request = new SubmitOrderRequest(
+                OrderType.Limit,
+                group.Symbol.SecurityType,
+                group.Symbol,
+                exitQty,
+                0m,
+                targetPrice,
+                _algorithm.UtcTime,
+                $"oco:{group.GroupId}:target",
+                props);
+
+            var targetTicket = _algorithm.SubmitOrderRequest(request);
+
+            if (targetTicket.Status == OrderStatus.Invalid)
+            {
+                Log.Error($"BracketOrderManager.ExecuteOcoSubmission: OCO submission rejected for group {group.GroupId}. " +
+                    $"Setting group as cancelled to prevent zombie state.");
+                group.IsCancelled = true;
+                return;
+            }
+
+            // Register the target ticket
+            group.TargetTicket = targetTicket;
+            _orderToGroup[targetTicket.OrderId] = group.GroupId;
+
+            Log.Debug($"BracketOrderManager.ExecuteOcoSubmission: OCO submitted for group {group.GroupId}. " +
+                $"TargetTicket={targetTicket.OrderId}, StopPrice={stopPrice}, TargetPrice={targetPrice}, " +
+                $"Qty={exitQty}");
+
+            // Note: The stop leg ticket will be registered via RegisterLegTicket()
+            // when the brokerage creates the phantom LEAN order for the Alpaca stop leg
+            // (same flow as bracket exit legs).
+        }
+
+        /// <summary>
+        /// State for a pending partial-fill rescue. Created by <see cref="RescuePartialFill"/>,
+        /// consumed by <see cref="CheckPendingRescue"/> when all old bracket orders are confirmed canceled.
+        /// </summary>
+        internal class PendingRescue
+        {
+            public Symbol Symbol { get; set; }
+            public decimal FilledQuantity { get; set; }
+            public decimal StopLossPrice { get; set; }
+            public decimal TakeProfitPrice { get; set; }
+            public decimal? StopLossLimitPrice { get; set; }
+            public decimal FillPrice { get; set; }
+            public BracketGroup NewGroup { get; set; }
+            public DateTime RequestedAt { get; set; }
         }
 
         #endregion

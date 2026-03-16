@@ -204,6 +204,50 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
             }
 
+            // --- Check for OCO order (standalone, no entry) ---
+            if (order.Properties is AlpacaOcoOrderProperties ocoProps && ocoProps.IsOcoOrder)
+            {
+                if (_manager == null && ocoProps.OriginatingManager != null)
+                {
+                    RegisterManager(ocoProps.OriginatingManager);
+                }
+
+                Log.Debug($"AlpacaBacktestingBrokerage.PlaceOrder: Detected OCO order. " +
+                    $"OrderId={order.Id}, GroupId={ocoProps.OcoGroupId}, Symbol={order.Symbol}, " +
+                    $"Qty={order.Quantity}, StopPrice={ocoProps.StopLossStopPrice}");
+
+                // Register the OCO state. Unlike brackets, both legs are created immediately.
+                var ocoState = new BacktestBracketState
+                {
+                    GroupId = ocoProps.OcoGroupId,
+                    EntryOrderId = 0,  // No entry order for OCO
+                    StopLossPrice = ocoProps.StopLossStopPrice.Value,
+                    TakeProfitPrice = order is LimitOrder lo ? lo.LimitPrice : 0m,
+                    StopLossLimitPrice = ocoProps.StopLossLimitPrice,
+                    Quantity = order.Quantity,  // Negative (sell)
+                    Symbol = order.Symbol,
+                    IsOco = true,
+                };
+
+                // Register the primary (limit/target) leg
+                ocoState.TargetOrderId = order.Id;
+                _bracketGroups[ocoProps.OcoGroupId] = ocoState;
+                _orderToGroup[order.Id] = ocoProps.OcoGroupId;
+
+                // Place the primary leg through base
+                var ocoResult = base.PlaceOrder(order);
+
+                // Register target ticket with manager
+                var targetTicket = Algorithm.Transactions.GetOrderTicket(order.Id);
+                if (targetTicket != null)
+                    _manager?.RegisterLegTicket(ocoProps.OcoGroupId, BracketLegType.TakeProfit, targetTicket);
+
+                // Immediately create the stop leg (no entry to wait for)
+                CreateOcoStopLeg(ocoState);
+
+                return ocoResult;
+            }
+
             // Always place through base — bracket entry orders are standard Market/Limit orders
             var result = base.PlaceOrder(order);
 
@@ -442,8 +486,8 @@ namespace QuantConnect.Brokerages.Alpaca
                         $"Cancelling stop leg (OCO). StopOrderId={state.StopOrderId}");
                     CancelLegIfOpen(state.StopOrderId);
                 }
-                // --- Entry cancelled → cancel legs ---
-                else if (e.OrderId == state.EntryOrderId && e.Status == OrderStatus.Canceled)
+                // --- Entry cancelled → cancel legs (skip for OCO which has no entry) ---
+                else if (!state.IsOco && e.OrderId == state.EntryOrderId && e.Status == OrderStatus.Canceled)
                 {
                     Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: Entry CANCELLED for group {groupId}. " +
                         $"Cancelling any exit legs.");
@@ -586,6 +630,53 @@ namespace QuantConnect.Brokerages.Alpaca
         }
 
         /// <summary>
+        /// Creates the stop-loss leg for an OCO group immediately.
+        /// Unlike bracket legs which wait for entry fill, OCO legs are created right away.
+        /// </summary>
+        private void CreateOcoStopLeg(BacktestBracketState state)
+        {
+            var now = Algorithm.UtcTime;
+
+            var stopProps = new AlpacaBracketOrderProperties
+            {
+                BracketGroupId = state.GroupId,
+                LegType = BracketLegType.StopLoss
+            };
+
+            SubmitOrderRequest stopRequest;
+            if (state.StopLossLimitPrice.HasValue)
+            {
+                stopRequest = new SubmitOrderRequest(
+                    OrderType.StopLimit,
+                    state.Symbol.SecurityType,
+                    state.Symbol,
+                    state.Quantity,
+                    state.StopLossPrice,
+                    state.StopLossLimitPrice.Value,
+                    now,
+                    $"oco:{state.GroupId}:stop",
+                    stopProps);
+            }
+            else
+            {
+                stopRequest = new SubmitOrderRequest(
+                    OrderType.StopMarket,
+                    state.Symbol.SecurityType,
+                    state.Symbol,
+                    state.Quantity,
+                    state.StopLossPrice,
+                    0m,
+                    now,
+                    $"oco:{state.GroupId}:stop",
+                    stopProps);
+            }
+
+            var stopTicket = Algorithm.Transactions.AddOrder(stopRequest);
+            Log.Debug($"AlpacaBacktestingBrokerage.CreateOcoStopLeg: Stop leg submitted for group {state.GroupId}. " +
+                $"OrderId={stopTicket.OrderId}, Status={stopTicket.Status}");
+        }
+
+        /// <summary>
         /// Cancels both exit legs of a bracket group if they exist and are open.
         /// </summary>
         private void CancelLegsIfExist(BacktestBracketState state)
@@ -631,6 +722,9 @@ namespace QuantConnect.Brokerages.Alpaca
 
         /// <summary>Optional stop-limit price for the stop-loss leg.</summary>
         public decimal? StopLossLimitPrice { get; set; }
+
+        /// <summary>True if this is an OCO group (no entry order).</summary>
+        public bool IsOco { get; set; }
 
         public override string ToString()
         {

@@ -422,6 +422,64 @@ namespace QuantConnect.Brokerages.Alpaca
                         leanOrders.Add(legLeanOrder);
                     }
                 }
+
+                // OCO parents also have legs nested under them.
+                // Handle the same flattening for OCO orders so we recover
+                // both legs on restart.
+                if (brokerageOrder.OrderClass == AlpacaMarket.OrderClass.OneCancelsOther
+                    && brokerageOrder.Legs.Count > 0)
+                {
+                    var recoveryGroupId = $"recovery-oco:{brokerageOrder.OrderId}";
+
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: OCO parent " +
+                        $"AlpacaId={brokerageOrder.OrderId} has {brokerageOrder.Legs.Count} legs. " +
+                        $"Flattening for reconciliation. RecoveryGroupId={recoveryGroupId}");
+
+                    foreach (var leg in brokerageOrder.Legs)
+                    {
+                        var legType = leg.OrderType switch
+                        {
+                            AlpacaMarket.OrderType.Limit => BracketLegType.TakeProfit,
+                            AlpacaMarket.OrderType.Stop => BracketLegType.StopLoss,
+                            AlpacaMarket.OrderType.StopLimit => BracketLegType.StopLoss,
+                            _ => (BracketLegType?)null
+                        };
+
+                        if (legType.HasValue)
+                        {
+                            var ocoLegProps = new AlpacaBracketOrderProperties
+                            {
+                                BracketGroupId = recoveryGroupId,
+                                LegType = legType.Value
+                            };
+                            if (!TryConvertToLeanOrder(leg, out var legLeanOrder, ocoLegProps))
+                            {
+                                continue;
+                            }
+
+                            _bracketLegMapping.TryAdd(leg.OrderId, new BracketLegInfo
+                            {
+                                BracketGroupId = recoveryGroupId,
+                                AlpacaLegOrderId = leg.OrderId,
+                                LegType = legType.Value,
+                            });
+
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Flattened OCO leg " +
+                                $"AlpacaId={leg.OrderId}, Type={legType}, " +
+                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}");
+
+                            leanOrders.Add(legLeanOrder);
+                        }
+                        else
+                        {
+                            if (!TryConvertToLeanOrder(leg, out var legLeanOrder))
+                            {
+                                continue;
+                            }
+                            leanOrders.Add(legLeanOrder);
+                        }
+                    }
+                }
             }
 
             return leanOrders;
@@ -578,6 +636,22 @@ namespace QuantConnect.Brokerages.Alpaca
                             $"Stop={bracketProps.StopLossStopPrice}, Target={bracketProps.TakeProfitLimitPrice}, " +
                             $"StopLimit={bracketProps.StopLossLimitPrice}");
                         PlaceBracketOrder(order, bracketProps);
+                        return;
+                    }
+
+                    // --- Check for OCO order ---
+                    if (order.Properties is AlpacaOcoOrderProperties ocoProps && ocoProps.IsOcoOrder)
+                    {
+                        if (_bracketManager == null && ocoProps.OriginatingManager != null)
+                        {
+                            RegisterManager(ocoProps.OriginatingManager);
+                        }
+
+                        Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOrder: Detected OCO order. " +
+                            $"OrderId={order.Id}, GroupId={ocoProps.OcoGroupId}, " +
+                            $"Symbol={order.Symbol}, Qty={order.Quantity}, " +
+                            $"StopPrice={ocoProps.StopLossStopPrice}, StopLimit={ocoProps.StopLossLimitPrice}");
+                        PlaceOcoOrder(order, ocoProps);
                         return;
                     }
 
@@ -786,6 +860,167 @@ namespace QuantConnect.Brokerages.Alpaca
                 else
                 {
                     Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Ticket not yet available " +
+                        $"for LeanId={leanOrder.Id}. Will be registered when trade update arrives.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Places an OCO (One-Cancels-Other) order using Alpaca's native OCO API.
+        /// Creates a linked pair of sell orders: limit (take-profit) + stop (stop-loss).
+        /// The primary order submitted through LEAN's pipeline is the take-profit (Limit) leg.
+        /// The stop leg is created as a phantom LEAN order.
+        /// </summary>
+        private void PlaceOcoOrder(Order order, AlpacaOcoOrderProperties ocoProps)
+        {
+            try
+            {
+                // Step 1: Create the primary leg (limit sell = take-profit).
+                // This is the order that was submitted through LEAN's pipeline.
+                // OCO primary leg must be a Limit order.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Creating base order for group {ocoProps.OcoGroupId}");
+                var baseOrder = order.CreateAlpacaOrder(order.AbsoluteQuantity, _symbolMapper, order.Type);
+
+                // .OneCancelsOther() is defined on LimitOrder (not SimpleOrderBase like .Bracket()).
+                if (baseOrder is not AlpacaMarket.LimitOrder limitOrder)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: OCO primary leg must be Limit. Got {order.Type}.");
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                        $"OCO primary leg must be Limit. Got {order.Type}.")
+                    { Status = Orders.OrderStatus.Invalid });
+                    return;
+                }
+
+                // Step 2: Chain .OneCancelsOther() to create the OCO pair.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Chaining .OneCancelsOther(). " +
+                    $"StopLoss={ocoProps.StopLossStopPrice}, StopLimit={ocoProps.StopLossLimitPrice}");
+
+                AlpacaMarket.OrderBase ocoOrder;
+                if (ocoProps.StopLossLimitPrice.HasValue)
+                {
+                    ocoOrder = limitOrder.OneCancelsOther(
+                        stopLossStopPrice: ocoProps.StopLossStopPrice.Value,
+                        stopLossLimitPrice: ocoProps.StopLossLimitPrice.Value);
+                }
+                else
+                {
+                    ocoOrder = limitOrder.OneCancelsOther(
+                        stopLossStopPrice: ocoProps.StopLossStopPrice.Value);
+                }
+
+                // Step 3: Submit to Alpaca
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Submitting OCO to Alpaca for group {ocoProps.OcoGroupId}");
+                var response = _tradingClient.PostOrderAsync(ocoOrder).SynchronouslyAwaitTaskResult();
+
+                if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: OCO REJECTED by Alpaca for group {ocoProps.OcoGroupId}. " +
+                        $"Response: {response?.OrderStatus}");
+                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                        "OCO Order Rejected by Alpaca") { Status = Orders.OrderStatus.Invalid });
+                    return;
+                }
+
+                // Step 4: Map the primary (take-profit) leg
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: OCO ACCEPTED. " +
+                    $"PrimaryAlpacaId={response.OrderId}, LegsCount={response.Legs.Count}, " +
+                    $"GroupId={ocoProps.OcoGroupId}");
+
+                order.BrokerId.Add(response.OrderId.ToString());
+                _duplicationExecutionOrderIdByBrokerageOrderId.TryAdd(response.OrderId, []);
+
+                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                    $"OCO Order Submitted (group: {ocoProps.OcoGroupId})")
+                { Status = Orders.OrderStatus.Submitted });
+
+                // Step 5: Create phantom LEAN order for the stop leg.
+                // OCO orders have exactly 1 leg (the stop). The primary order IS the limit.
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Processing {response.Legs.Count} legs " +
+                    $"for group {ocoProps.OcoGroupId}");
+
+                foreach (var leg in response.Legs)
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Processing leg. " +
+                        $"AlpacaId={leg.OrderId}, Type={leg.OrderType}, Side={leg.OrderSide}, " +
+                        $"StopPrice={leg.StopPrice}");
+                    CreateAndRegisterOcoLegOrder(leg, order.Symbol, ocoProps);
+                }
+
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: OCO fully processed for group {ocoProps.OcoGroupId}");
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Exception placing OCO for group {ocoProps.OcoGroupId}: {ex}");
+                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                    $"OCO Order Failed: {ex.Message}") { Status = Orders.OrderStatus.Invalid });
+            }
+        }
+
+        /// <summary>
+        /// Creates a phantom LEAN order for an Alpaca OCO stop leg and registers it
+        /// with tracking dictionaries and the BracketOrderManager.
+        /// Follows the same pattern as <see cref="CreateAndRegisterLegOrder"/> for bracket legs.
+        /// </summary>
+        private void CreateAndRegisterOcoLegOrder(IOrder alpacaLeg, Symbol symbol,
+            AlpacaOcoOrderProperties ocoProps)
+        {
+            // OCO legs are always the stop-loss side (the primary is the limit/target)
+            var legType = alpacaLeg.OrderType switch
+            {
+                AlpacaMarket.OrderType.Stop => BracketLegType.StopLoss,
+                AlpacaMarket.OrderType.StopLimit => BracketLegType.StopLoss,
+                AlpacaMarket.OrderType.Limit => BracketLegType.TakeProfit,
+                _ => throw new NotSupportedException(
+                    $"Unexpected OCO leg order type: {alpacaLeg.OrderType}")
+            };
+
+            // Use AlpacaBracketOrderProperties for leg orders (same as bracket legs)
+            // so the existing HandleTradeUpdate routing works identically.
+            var legProps = new AlpacaBracketOrderProperties
+            {
+                BracketGroupId = ocoProps.OcoGroupId,
+                LegType = legType
+            };
+
+            if (!TryConvertToLeanOrder(alpacaLeg, out var leanOrder, legProps))
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.CreateAndRegisterOcoLegOrder: Failed to convert OCO leg " +
+                    $"AlpacaId={alpacaLeg.OrderId} to LEAN order for group {ocoProps.OcoGroupId}");
+                return;
+            }
+
+            Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterOcoLegOrder: Leg type={legType}, " +
+                $"AlpacaId={alpacaLeg.OrderId}, LeanOrderType={leanOrder.Type}, " +
+                $"GroupId={ocoProps.OcoGroupId}");
+
+            // Register in bracket leg mapping for trade update routing
+            _bracketLegMapping[alpacaLeg.OrderId] = new BracketLegInfo
+            {
+                BracketGroupId = ocoProps.OcoGroupId,
+                AlpacaLegOrderId = alpacaLeg.OrderId,
+                LegType = legType,
+            };
+
+            // Store in provisional mapping
+            var alpacaOrderIdStr = alpacaLeg.OrderId.ToString();
+            _provisionalBracketLegOrders[alpacaOrderIdStr] = leanOrder;
+
+            // Notify LEAN's engine
+            OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(leanOrder));
+
+            // Register with BracketOrderManager
+            if (_bracketManager != null && leanOrder.Id != 0)
+            {
+                var ticket = _orderProvider.GetOrderTicket(leanOrder.Id);
+                if (ticket != null)
+                {
+                    _bracketManager.RegisterLegTicket(ocoProps.OcoGroupId, legType, ticket);
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterOcoLegOrder: Registered leg ticket " +
+                        $"LeanId={leanOrder.Id} with BracketOrderManager for group {ocoProps.OcoGroupId}");
+                }
+                else
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterOcoLegOrder: Ticket not yet available " +
                         $"for LeanId={leanOrder.Id}. Will be registered when trade update arrives.");
                 }
             }

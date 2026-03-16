@@ -120,6 +120,13 @@ namespace QuantConnect.Brokerages.Alpaca
         public bool IsComplete => ExitFilled || IsCancelled;
 
         /// <summary>
+        /// True if this group is a standalone OCO (no entry order).
+        /// OCO groups are created by <see cref="BracketOrderManager.RescuePartialFill"/>
+        /// with EntryFilled = true and no EntryTicket.
+        /// </summary>
+        public bool IsOco => EntryFilled && EntryTicket == null;
+
+        /// <summary>
         /// LEAN order IDs of legs currently undergoing an Alpaca replace (update).
         /// Populated by BracketOrderManager when UpdateStop/UpdateTarget is called,
         /// entries removed when the UpdateSubmitted or terminal event arrives.
