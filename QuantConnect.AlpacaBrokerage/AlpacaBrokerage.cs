@@ -67,6 +67,14 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Follows the same pattern as LeanOrderByZeroCrossBrokerageOrderId for cross-zero orders.
         /// </summary>
         private readonly ConcurrentDictionary<string, Order> _provisionalBracketLegOrders = new();
+
+        /// <summary>
+        /// Stores pending PATCH requests for bracket legs rejected by Alpaca with "pending_new".
+        /// Keyed by the original Alpaca order ID (Guid). The retry is replayed in
+        /// HandleTradeUpdate when TradeEvent.New arrives for that order.
+        /// </summary>
+        private readonly ConcurrentDictionary<Guid, ChangeOrderRequest> _pendingLegReplaces = new();
+
         private AlpacaBrokerageSymbolMapper _symbolMapper;
 
         private IAlpacaTradingClient _tradingClient;
@@ -866,6 +874,36 @@ namespace QuantConnect.Brokerages.Alpaca
                 switch (obj.Event)
                 {
                     case TradeEvent.New:
+                        // we don't send anything for this event
+                        _duplicationExecutionOrderIdByBrokerageOrderId.TryAdd(obj.Order.OrderId, []);
+                        // Deferred PATCH retry: if UpdateOrder was rejected with "pending_new" for this
+                        // order, the request was stored. Now that the order is in stable "new" state,
+                        // retry the PATCH. Alpaca will respond with a "replaced" event which the normal
+                        // HandleTradeUpdate flow handles (UpdateSubmitted, bracket leg remapping, etc.).
+                        if (_pendingLegReplaces.TryRemove(obj.Order.OrderId, out var retryRequest))
+                        {
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                $"Retrying deferred PATCH for order {obj.Order.OrderId} " +
+                                $"(order now stable after pending_new).");
+                            try
+                            {
+                                _tradingClient.PatchOrderAsync(retryRequest).SynchronouslyAwaitTaskResult();
+                                Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                    $"Deferred PATCH submitted successfully for order {obj.Order.OrderId}. " +
+                                    $"Awaiting Alpaca 'replaced' event for final confirmation.");
+                            }
+                            catch (Exception retryEx)
+                            {
+                                Log.Error(retryEx, $"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                    $"Deferred PATCH retry failed for order {obj.Order.OrderId}.");
+                                if (leanOrder != null)
+                                {
+                                    OnOrderEvent(new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero, retryEx.Message)
+                                        { Status = Orders.OrderStatus.Invalid });
+                                }
+                            }
+                        }
+                        return;
                     case TradeEvent.PendingNew:
                         // we don't send anything for this event
                         _duplicationExecutionOrderIdByBrokerageOrderId.TryAdd(obj.Order.OrderId, []);
@@ -1119,6 +1157,34 @@ namespace QuantConnect.Brokerages.Alpaca
             }
             catch (Exception ex)
             {
+                // Alpaca returns "order parameters are not changed" when the requested
+                // price already matches the current order price. This is not an error —
+                // the order is already at the target price, so treat it as success.
+                // Firing Invalid here would kill the ticket and cause all subsequent
+                // updates for this leg to be silently dropped by BracketOrderManager.
+                if (ex.Message.Contains("order parameters are not changed"))
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(UpdateOrder)}: " +
+                        $"Alpaca reported 'order parameters are not changed' for order {order.Id} — " +
+                        $"treating as success (price already matches requested value).");
+                    return true;
+                }
+
+                // Alpaca rejects PATCH while the order is in its transient "pending_new" state
+                // (between "accepted" and "new"). This is the same deferred-retry pattern as
+                // the LEAN-level "New" state deferral: store the request and replay it from
+                // HandleTradeUpdate when TradeEvent.New arrives for this order.
+                // Returning true keeps the ticket alive; the real UpdateSubmitted fires later
+                // via the normal "replaced" event cascade once the retry PATCH succeeds.
+                if (ex.Message.Contains("pending_new"))
+                {
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(UpdateOrder)}: " +
+                        $"Alpaca 'pending_new' rejection for order {order.Id} (AlpacaId={oldAlpacaGuid}). " +
+                        $"Storing PATCH request — will retry when order reaches 'new' state.");
+                    _pendingLegReplaces[oldAlpacaGuid] = pathOrderRequest;
+                    return true;
+                }
+
                 OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, ex.Message) { Status = Orders.OrderStatus.Invalid });
                 return false;
             }

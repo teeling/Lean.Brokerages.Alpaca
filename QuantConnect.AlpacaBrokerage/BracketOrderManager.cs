@@ -95,13 +95,14 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Negative for short brackets (sell entry, buy exits).</param>
         /// <param name="stopLossPrice">Stop-loss trigger price.</param>
         /// <param name="takeProfitPrice">Take-profit limit price.</param>
-        /// <param name="entryType">Entry order type. Market (default) or Limit.</param>
-        /// <param name="entryLimitPrice">Required if entryType is Limit.</param>
+        /// <param name="entryType">Entry order type: Market (default), Limit, or StopLimit.</param>
+        /// <param name="entryLimitPrice">Required if entryType is Limit or StopLimit (fill cap price).</param>
+        /// <param name="entryStopPrice">Required if entryType is StopLimit (trigger price).</param>
         /// <param name="stopLossLimitPrice">Optional: makes the stop-loss a stop-limit order.</param>
         /// <param name="tag">Optional order tag for identification.</param>
         /// <returns>A <see cref="BracketGroup"/> for tracking the bracket's lifecycle.</returns>
         /// <exception cref="ArgumentException">If parameters fail validation.</exception>
-        /// <exception cref="NotSupportedException">If entryType is not Market or Limit.</exception>
+        /// <exception cref="NotSupportedException">If entryType is not Market, Limit, or StopLimit.</exception>
         public BracketGroup PlaceBracketOrder(
             Symbol symbol,
             decimal quantity,
@@ -109,22 +110,34 @@ namespace QuantConnect.Brokerages.Alpaca
             decimal takeProfitPrice,
             OrderType entryType = OrderType.Market,
             decimal? entryLimitPrice = null,
+            decimal? entryStopPrice = null,
             decimal? stopLossLimitPrice = null,
             string tag = "")
         {
+            // --- Round all prices to Alpaca's maximum precision ---
+            // Matches LEAN's BrokerageTransactionHandler.RoundOrderPrices convention:
+            // silently round and log a warning rather than throw. The algorithm should
+            // not need to pre-round prices before calling PlaceBracketOrder.
+            stopLossPrice    = RoundPrice(stopLossPrice, nameof(stopLossPrice));
+            takeProfitPrice  = RoundPrice(takeProfitPrice, nameof(takeProfitPrice));
+            if (entryLimitPrice.HasValue)   entryLimitPrice   = RoundPrice(entryLimitPrice.Value,   nameof(entryLimitPrice));
+            if (entryStopPrice.HasValue)    entryStopPrice    = RoundPrice(entryStopPrice.Value,    nameof(entryStopPrice));
+            if (stopLossLimitPrice.HasValue) stopLossLimitPrice = RoundPrice(stopLossLimitPrice.Value, nameof(stopLossLimitPrice));
+
             // --- Validate all parameters before doing anything ---
             ValidateBracketParameters(symbol, quantity, stopLossPrice,
-                takeProfitPrice, entryType, entryLimitPrice);
+                takeProfitPrice, entryType, entryLimitPrice, entryStopPrice);
 
             // --- Create the bracket group for state tracking ---
             var groupId = Guid.NewGuid().ToString("N");
             var group = new BracketGroup(groupId, symbol, quantity,
-                stopLossPrice, takeProfitPrice, stopLossLimitPrice);
+                stopLossPrice, takeProfitPrice, stopLossLimitPrice,
+                entryType, entryStopPrice);
             _groups[groupId] = group;
 
             Log.Debug($"BracketOrderManager.PlaceBracketOrder: Created group {groupId} " +
                 $"for {symbol} qty={quantity} stop={stopLossPrice} target={takeProfitPrice} " +
-                $"entryType={entryType} stopLimitPrice={stopLossLimitPrice}");
+                $"entryType={entryType} entryStop={entryStopPrice} stopLimitPrice={stopLossLimitPrice}");
 
             // --- Build bracket properties for the brokerage to detect ---
             // This is the data contract between the manager and the brokerage.
@@ -159,9 +172,17 @@ namespace QuantConnect.Brokerages.Alpaca
                         symbol, quantity, 0, entryLimitPrice.Value, _algorithm.UtcTime, entryTag, props);
                     break;
 
+                case OrderType.StopLimit:
+                    Log.Debug($"BracketOrderManager.PlaceBracketOrder: Placing stop-limit entry " +
+                        $"stop={entryStopPrice} limit={entryLimitPrice} for group {groupId}");
+                    request = new SubmitOrderRequest(OrderType.StopLimit, symbol.SecurityType,
+                        symbol, quantity, entryStopPrice.Value, entryLimitPrice.Value,
+                        _algorithm.UtcTime, entryTag, props);
+                    break;
+
                 default:
                     throw new NotSupportedException(
-                        $"BracketOrderManager: Entry type {entryType} not supported. Use Market or Limit.");
+                        $"BracketOrderManager: Entry type {entryType} not supported. Use Market, Limit, or StopLimit.");
             }
 
             var entryTicket = _algorithm.SubmitOrderRequest(request);
@@ -200,15 +221,40 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Debug($"BracketOrderManager.CancelBracket: Cancelling group {groupId}. " +
                 $"EntryFilled={group.EntryFilled}");
 
+            // Record that a cancel was requested regardless of current state.
+            // The backtesting brokerage checks this after CreateExitLegs to handle the race
+            // where the entry fills after CancelBracket was called (cancel-after-update race).
+            group.CancelRequested = true;
+
             // Do NOT set IsCancelled here eagerly — it will be set by ProcessOrderEvent
             // when the actual Canceled OrderEvent arrives from the brokerage. Setting it
             // eagerly would cause IsComplete to return true even if the cancel is rejected.
 
             if (!group.EntryFilled)
             {
-                // Cancel entry — brokerage handles cascade to legs
-                Log.Debug($"BracketOrderManager.CancelBracket: Cancelling entry ticket {group.EntryTicket?.OrderId} for group {groupId}");
-                group.EntryTicket?.Cancel($"Bracket cancelled: {groupId}");
+                // Cancel entry — brokerage handles cascade to legs.
+                // IMPORTANT: If the entry is still in "New" status (not yet ACK'd by the
+                // broker), LEAN will silently reject the cancel. In that case we set
+                // PendingCancel so ProcessOrderEvent retries when the order transitions
+                // to Submitted or Filled.
+                var entryTicket = group.EntryTicket;
+                if (entryTicket == null)
+                {
+                    Log.Error($"BracketOrderManager.CancelBracket: Entry ticket is null for group {groupId}");
+                    return false;
+                }
+
+                if (entryTicket.Status == OrderStatus.New)
+                {
+                    Log.Debug($"BracketOrderManager.CancelBracket: Entry ticket {entryTicket.OrderId} " +
+                        $"still in New status for group {groupId}. Setting PendingCancel for deferred retry.");
+                    group.PendingCancel = true;
+                }
+                else
+                {
+                    Log.Debug($"BracketOrderManager.CancelBracket: Cancelling entry ticket {entryTicket.OrderId} for group {groupId}");
+                    entryTicket.Cancel($"Bracket cancelled: {groupId}");
+                }
             }
             else
             {
@@ -288,6 +334,16 @@ namespace QuantConnect.Brokerages.Alpaca
                 return false;
             }
 
+            // Guard: stop must be strictly below the current target price.
+            // Alpaca rejects brackets where stop >= take_profit.
+            if (group.TakeProfitPrice > 0 && newStopPrice >= group.TakeProfitPrice)
+            {
+                Log.Error($"BracketOrderManager.UpdateStop: Rejected update for group {groupId} — " +
+                    $"newStopPrice {newStopPrice} >= takeProfitPrice {group.TakeProfitPrice}. " +
+                    $"Stop must be strictly below the target.");
+                return false;
+            }
+
             Log.Debug($"BracketOrderManager.UpdateStop: Updating stop for group {groupId} " +
                 $"from {group.StopLossPrice} to {newStopPrice}" +
                 (newLimitPrice.HasValue ? $" (limitPrice={newLimitPrice})" : ""));
@@ -347,6 +403,16 @@ namespace QuantConnect.Brokerages.Alpaca
                 return false;
             }
 
+            // Guard: target must be strictly above the current stop price.
+            // Alpaca rejects brackets where take_profit <= stop_loss.
+            if (group.StopLossPrice > 0 && newLimitPrice <= group.StopLossPrice)
+            {
+                Log.Error($"BracketOrderManager.UpdateTarget: Rejected update for group {groupId} — " +
+                    $"newTargetPrice {newLimitPrice} <= stopLossPrice {group.StopLossPrice}. " +
+                    $"Target must be strictly above the stop.");
+                return false;
+            }
+
             Log.Debug($"BracketOrderManager.UpdateTarget: Updating target for group {groupId} " +
                 $"from {group.TakeProfitPrice} to {newLimitPrice}");
 
@@ -370,6 +436,68 @@ namespace QuantConnect.Brokerages.Alpaca
                     $"Response: {response.ErrorCode} - {response.ErrorMessage}");
             }
 
+            return response.IsSuccess;
+        }
+
+        /// <summary>
+        /// Updates the entry order price(s) for an active bracket.
+        /// Safe to call immediately after PlaceBracketOrder — if the entry order is still
+        /// in "New" state (not yet ACK'd by the broker), the update is deferred and replayed
+        /// automatically by ProcessOrderEvent once the order transitions to Submitted.
+        /// Only valid for Limit or StopLimit entry brackets (market entries cannot be updated).
+        /// For stop-limit entries, pass both newLimitPrice and newEntryStopPrice to move
+        /// the trigger and fill cap together.
+        /// </summary>
+        /// <param name="groupId">The bracket group ID.</param>
+        /// <param name="newLimitPrice">The new entry limit (fill cap) price.</param>
+        /// <param name="newEntryStopPrice">Optional new stop trigger price (stop-limit entries only).</param>
+        /// <returns>True if the update was submitted (or deferred) successfully.</returns>
+        public bool UpdateEntry(string groupId, decimal newLimitPrice, decimal? newEntryStopPrice = null)
+        {
+            if (!_groups.TryGetValue(groupId, out var group))
+            {
+                Log.Error($"BracketOrderManager.UpdateEntry: Group {groupId} not found.");
+                return false;
+            }
+
+            if (group.EntryTicket == null || group.EntryTicket.Status.IsClosed())
+            {
+                Log.Error($"BracketOrderManager.UpdateEntry: Entry ticket is null or closed for group {groupId}. " +
+                    $"EntryTicket={group.EntryTicket?.OrderId}({group.EntryTicket?.Status})");
+                return false;
+            }
+
+            var fields = new UpdateOrderFields { LimitPrice = newLimitPrice };
+            if (newEntryStopPrice.HasValue)
+                fields.StopPrice = newEntryStopPrice.Value;
+
+            // If the entry order hasn't been ACK'd yet (still New), LEAN will reject the
+            // Update() call before it reaches our brokerage plugin. Defer it: store the
+            // requested fields and ProcessOrderEvent will replay when status transitions.
+            if (group.EntryTicket.Status == OrderStatus.New)
+            {
+                Log.Debug($"BracketOrderManager.UpdateEntry: Entry still New for group {groupId}. " +
+                    $"Deferring update to limit={newLimitPrice}" +
+                    (newEntryStopPrice.HasValue ? $" stop={newEntryStopPrice}" : "") +
+                    " until Submitted.");
+                group.PendingEntryUpdate = fields;
+                if (newEntryStopPrice.HasValue) group.EntryStopPrice = newEntryStopPrice.Value;
+                return true;
+            }
+
+            group.PendingEntryUpdate = null;
+            Log.Debug($"BracketOrderManager.UpdateEntry: Updating entry for group {groupId} " +
+                $"to limit={newLimitPrice}" + (newEntryStopPrice.HasValue ? $" stop={newEntryStopPrice}" : ""));
+            var response = group.EntryTicket.Update(fields);
+            if (response.IsSuccess)
+            {
+                if (newEntryStopPrice.HasValue) group.EntryStopPrice = newEntryStopPrice.Value;
+            }
+            else
+            {
+                Log.Error($"BracketOrderManager.UpdateEntry: Failed to update entry for group {groupId}. " +
+                    $"Response: {response.ErrorCode} - {response.ErrorMessage}");
+            }
             return response.IsSuccess;
         }
 
@@ -508,6 +636,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
                 else if (e.Status == OrderStatus.Canceled || e.Status == OrderStatus.Invalid)
                 {
+                    group.PendingCancel = false; // no longer needed
                     group.IsCancelled = true;
                     Log.Debug($"BracketOrderManager.OnOrderEvent: Entry CANCELLED/INVALID for group {groupId}. " +
                         $"Status={e.Status}. Bracket is now complete.");
@@ -516,6 +645,44 @@ namespace QuantConnect.Brokerages.Alpaca
                 {
                     Log.Debug($"BracketOrderManager.OnOrderEvent: Entry status update for group {groupId}: {e.Status}");
                 }
+
+                // --- Deferred cancel: retry CancelBracket now that the order has left "New" status ---
+                // This handles the race where CancelBracket was called before the broker ACK'd the order.
+                // Now that LEAN has a non-New status, the cancel will be accepted.
+                if (group.PendingCancel && e.Status != OrderStatus.New)
+                {
+                    group.PendingCancel = false;
+                    Log.Debug($"BracketOrderManager.ProcessOrderEvent: Executing deferred CancelBracket " +
+                        $"for group {groupId} (entry now {e.Status})");
+                    CancelBracket(groupId);
+                }
+
+                // --- Deferred entry update: replay UpdateEntry now that the order has left "New" status ---
+                // This handles the race where UpdateEntry() was called before the broker ACK'd the order.
+                // LEAN hard-rejects updates on "New" orders, so UpdateEntry stored the fields here.
+                // If the entry was cancelled/invalid (e.g. CancelBracket raced ahead), discard silently.
+                if (group.PendingEntryUpdate != null && e.Status != OrderStatus.New)
+                {
+                    var pendingFields = group.PendingEntryUpdate;
+                    group.PendingEntryUpdate = null;
+                    if (group.IsCancelled)
+                    {
+                        Log.Debug($"BracketOrderManager.ProcessOrderEvent: Discarding deferred entry update " +
+                            $"for group {groupId} — entry was cancelled before replay.");
+                    }
+                    else
+                    {
+                        Log.Debug($"BracketOrderManager.ProcessOrderEvent: Replaying deferred entry update " +
+                            $"for group {groupId} to {pendingFields.LimitPrice} (entry now {e.Status})");
+                        var updateResponse = group.EntryTicket?.Update(pendingFields);
+                        if (updateResponse?.IsSuccess == false)
+                        {
+                            Log.Error($"BracketOrderManager.ProcessOrderEvent: Deferred entry update failed for group {groupId}. " +
+                                $"{updateResponse.ErrorCode} - {updateResponse.ErrorMessage}");
+                        }
+                    }
+                }
+
                 return;
             }
 
@@ -592,7 +759,8 @@ namespace QuantConnect.Brokerages.Alpaca
             decimal stopLossPrice,
             decimal takeProfitPrice,
             OrderType entryType,
-            decimal? entryLimitPrice)
+            decimal? entryLimitPrice,
+            decimal? entryStopPrice = null)
         {
             if (symbol == null)
             {
@@ -608,6 +776,16 @@ namespace QuantConnect.Brokerages.Alpaca
             {
                 throw new ArgumentException(
                     "BracketOrderManager: entryLimitPrice is required for limit entry orders.");
+            }
+
+            if (entryType == OrderType.StopLimit)
+            {
+                if (!entryStopPrice.HasValue)
+                    throw new ArgumentException(
+                        "BracketOrderManager: entryStopPrice is required for stop-limit entry orders.");
+                if (!entryLimitPrice.HasValue)
+                    throw new ArgumentException(
+                        "BracketOrderManager: entryLimitPrice is required for stop-limit entry orders.");
             }
 
             // Long bracket: target must be above stop
@@ -633,25 +811,27 @@ namespace QuantConnect.Brokerages.Alpaca
                     "BracketOrderManager: Take-profit and stop-loss must be at least $0.01 apart.");
             }
 
-            // Sub-penny price validation (Alpaca restriction)
-            ValidateSubPenny(stopLossPrice, nameof(stopLossPrice));
-            ValidateSubPenny(takeProfitPrice, nameof(takeProfitPrice));
         }
 
         /// <summary>
-        /// Validates that a price doesn't exceed Alpaca's maximum decimal places.
-        /// Prices >= $1.00: max 2 decimal places.
-        /// Prices < $1.00: max 4 decimal places.
+        /// Rounds a price to Alpaca's maximum allowed precision and logs a warning if
+        /// rounding was applied. Matches the convention of LEAN's BrokerageTransactionHandler
+        /// which rounds silently rather than rejecting the order.
+        ///
+        /// Alpaca precision rules:
+        ///   Prices >= $1.00 → max 2 decimal places (cent precision)
+        ///   Prices  < $1.00 → max 4 decimal places (sub-penny stocks)
         /// </summary>
-        private static void ValidateSubPenny(decimal price, string name)
+        private static decimal RoundPrice(decimal price, string name)
         {
             var maxDecimals = price >= 1.0m ? 2 : 4;
-            if (price != Math.Round(price, maxDecimals))
+            var rounded = Math.Round(price, maxDecimals);
+            if (rounded != price)
             {
-                throw new ArgumentException(
-                    $"BracketOrderManager: {name} ({price}) exceeds maximum {maxDecimals} " +
-                    $"decimal places for prices {(price >= 1.0m ? ">= $1.00" : "< $1.00")}.");
+                Log.Debug($"BracketOrderManager: {name} rounded from {price} to {rounded} " +
+                    $"(Alpaca max {maxDecimals} decimal places).");
             }
+            return rounded;
         }
 
         #endregion

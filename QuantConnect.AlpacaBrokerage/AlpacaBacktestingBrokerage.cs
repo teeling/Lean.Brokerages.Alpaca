@@ -415,6 +415,18 @@ namespace QuantConnect.Brokerages.Alpaca
                     Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: Entry FILLED for group {groupId}. " +
                         $"Creating exit legs. FillPrice={e.FillPrice}");
                     CreateExitLegs(state, e);
+
+                    // After creating exit legs, check if CancelBracket was already called
+                    // before the entry filled (cancel-update race: update moved price to market,
+                    // cancel was pending, but fill won the race on the next bar).
+                    // The exit legs are now live — cancel them immediately.
+                    var group = _manager?.GetGroup(state.GroupId);
+                    if (group != null && group.CancelRequested)
+                    {
+                        Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: CancelRequested flag set for group {groupId} " +
+                            $"— cancelling exit legs created after deferred fill.");
+                        CancelLegsIfExist(state);
+                    }
                 }
                 // --- Stop filled → cancel target (OCO) ---
                 else if (e.OrderId == state.StopOrderId && e.Status == OrderStatus.Filled)

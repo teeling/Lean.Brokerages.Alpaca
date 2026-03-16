@@ -67,6 +67,17 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         public decimal? StopLossLimitPrice { get; }
 
+        /// <summary>
+        /// Entry order type: Market, Limit, or StopLimit.
+        /// </summary>
+        public OrderType EntryType { get; }
+
+        /// <summary>
+        /// Stop trigger price for stop-limit entry orders. Null for Market/Limit entries.
+        /// Updated by UpdateEntry when the entry stop price is changed.
+        /// </summary>
+        public decimal? EntryStopPrice { get; internal set; }
+
         // --- Order tickets ---
 
         /// <summary>
@@ -120,6 +131,35 @@ namespace QuantConnect.Brokerages.Alpaca
         internal readonly HashSet<int> PendingUpdateOrderIds = new();
 
         /// <summary>
+        /// True if CancelBracket was called while the entry order was still in "New"
+        /// status (not yet ACK'd by the broker). LEAN rejects cancels on "New" orders,
+        /// so the cancel is deferred: ProcessOrderEvent will fire CancelBracket again
+        /// when the entry transitions to Submitted (or Filled).
+        /// </summary>
+        internal bool PendingCancel { get; set; }
+
+        /// <summary>
+        /// True if CancelBracket was called at any point before the bracket completed.
+        /// Unlike PendingCancel (which is specific to the "New" state race in live trading),
+        /// this flag persists even after the entry fills — allowing the backtesting brokerage
+        /// to detect and cancel exit legs that were created after a cancel was already requested.
+        ///
+        /// Scenario: CancelBracket() called on an unfilled limit entry → entry in CancelPending
+        /// state → but UpdateEntry resolves first → entry fills on next bar → CreateExitLegs runs.
+        /// Without this flag, the exit legs would be orphaned because no cancel was re-attempted.
+        /// </summary>
+        internal bool CancelRequested { get; set; }
+
+        /// <summary>
+        /// Deferred entry update: set when UpdateEntry() is called while the entry order
+        /// is still in "New" status (not yet ACK'd by the broker). LEAN rejects updates
+        /// on "New" orders, so the update is deferred: ProcessOrderEvent will replay it
+        /// when the entry transitions to Submitted. Last-write-wins if called multiple
+        /// times before ACK — only the most recent requested price is applied.
+        /// </summary>
+        internal UpdateOrderFields PendingEntryUpdate { get; set; }
+
+        /// <summary>
         /// Actual entry fill price. Set when the entry order fills.
         /// </summary>
         public decimal? FillPrice { get; internal set; }
@@ -144,13 +184,17 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <param name="stopLossPrice">Initial stop-loss trigger price.</param>
         /// <param name="takeProfitPrice">Initial take-profit limit price.</param>
         /// <param name="stopLossLimitPrice">Optional stop-limit price for the stop-loss leg.</param>
+        /// <param name="entryType">Entry order type (Market, Limit, or StopLimit).</param>
+        /// <param name="entryStopPrice">Stop trigger price for stop-limit entries. Null otherwise.</param>
         public BracketGroup(
             string groupId,
             Symbol symbol,
             decimal quantity,
             decimal stopLossPrice,
             decimal takeProfitPrice,
-            decimal? stopLossLimitPrice = null)
+            decimal? stopLossLimitPrice = null,
+            OrderType entryType = OrderType.Market,
+            decimal? entryStopPrice = null)
         {
             GroupId = groupId;
             Symbol = symbol;
@@ -158,6 +202,8 @@ namespace QuantConnect.Brokerages.Alpaca
             StopLossPrice = stopLossPrice;
             TakeProfitPrice = takeProfitPrice;
             StopLossLimitPrice = stopLossLimitPrice;
+            EntryType = entryType;
+            EntryStopPrice = entryStopPrice;
         }
 
         /// <summary>
@@ -170,7 +216,10 @@ namespace QuantConnect.Brokerages.Alpaca
                 : (EntryFilled ? "Active(entry filled, waiting for exit)" : "Pending(entry not filled)");
             var qtyInfo = FilledQuantity != 0 && FilledQuantity != Quantity
                 ? $"qty={FilledQuantity}/{Quantity}" : $"qty={Quantity}";
-            return $"BracketGroup[{GroupId}] {Symbol} {qtyInfo} stop={StopLossPrice} target={TakeProfitPrice} status={status}";
+            var entryInfo = EntryType == OrderType.StopLimit
+                ? $"entry=stop-limit(stop={EntryStopPrice})"
+                : $"entry={EntryType.ToString().ToLower()}";
+            return $"BracketGroup[{GroupId}] {Symbol} {qtyInfo} {entryInfo} stop={StopLossPrice} target={TakeProfitPrice} status={status}";
         }
     }
 }
