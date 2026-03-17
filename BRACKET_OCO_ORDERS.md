@@ -352,3 +352,237 @@ Key log patterns to search for during debugging:
 | `Rejected update — newStopPrice >= takeProfitPrice` | Cross-price guard fired |
 | `CancelRequested flag set...cancelling exit legs created after deferred fill` | Cancel-after-update race resolved (backtest) |
 | `Clearing PendingUpdateOrderId` | Replace completed |
+
+---
+---
+
+# OCO Orders — Developer Guide
+
+This section covers the standalone OCO (One-Cancels-Other) order feature and the
+partial-fill rescue flow. Both use `BracketOrderManager` and return `BracketGroup`
+objects, so all the state-reading and update/cancel methods from the bracket section
+above apply.
+
+---
+
+## What Is an OCO Order?
+
+An OCO order is a pair of linked exit orders — a **take-profit** limit sell and a
+**stop-loss** stop sell — placed against an existing position. When one leg fills,
+the other is automatically cancelled. Unlike a bracket order, there is no entry leg.
+
+Use cases:
+- You already hold shares (acquired via market order, partial fill, or other means)
+  and want to attach stop + target protection.
+- A bracket entry partially filled and timed out — you need to protect the filled
+  shares without placing a new entry.
+
+---
+
+## API
+
+### Placing a Standalone OCO
+
+```python
+oco_group = self.bracket_mgr.PlaceOcoOrder(
+    symbol,                       # LEAN Symbol object
+    quantity=filled_qty,          # signed exit quantity (negative for selling a long)
+    stopLossPrice=stop,           # stop trigger price
+    takeProfitPrice=target,       # limit sell price
+    fillPrice=avg_fill_price,     # the price the position was acquired at
+    filledQuantity=filled_qty,    # number of shares held
+)
+
+# With stop-limit stop-loss (instead of stop-market)
+oco_group = self.bracket_mgr.PlaceOcoOrder(
+    symbol, quantity, stopLossPrice, takeProfitPrice,
+    fillPrice, filledQuantity,
+    stopLossLimitPrice=stop_limit,  # limit cap on the stop leg
+)
+```
+
+`PlaceOcoOrder` returns a `BracketGroup` with `EntryFilled=True` and `EntryTicket=None`.
+The exit legs are submitted immediately.
+
+### Rescuing a Partial Fill
+
+When a bracket entry partially fills and you want to cancel the remaining entry
+while protecting the filled shares:
+
+```python
+if group.FilledQuantity > 0 and not group.EntryFilled:
+    oco_group = self.bracket_mgr.RescuePartialFill(group.GroupId)
+    if oco_group:
+        # oco_group is the new OCO protecting the partial fill
+        # The old bracket is cancelled automatically
+        self._active_brackets[symbol] = oco_group
+```
+
+`RescuePartialFill`:
+1. Snapshots the current `FilledQuantity`, stop, and target from the old bracket.
+2. Creates a new `BracketGroup` (OCO) pre-populated with those values.
+3. Calls `CancelBracket` on the old bracket.
+4. Waits for all old bracket legs to be confirmed cancelled (via `CheckPendingRescue`).
+5. Only then submits the actual OCO exit legs to Alpaca.
+
+Returns `null` if:
+- The group ID is not found.
+- `FilledQuantity` is zero (use `CancelBracket` instead).
+- `EntryFilled` is already true (no rescue needed — entry completed).
+
+### Monitoring Stale Rescues
+
+If the cancel confirmation for the old bracket is lost (e.g. WebSocket disconnect),
+the rescue OCO legs will never be submitted. Monitor for this:
+
+```python
+# In a scheduled event or on_minute_bar:
+self.bracket_mgr.CheckStalePendingRescues(
+    self.utc_time,
+    timedelta(seconds=30),
+)
+```
+
+Logs an error if any pending rescue has been waiting longer than `maxAge`.
+
+### Cancelling / Updating an OCO
+
+Once placed, an OCO group behaves identically to a filled bracket — the same
+cancel and update methods work:
+
+```python
+self.bracket_mgr.cancel_bracket(oco_group.GroupId)
+self.bracket_mgr.update_stop(oco_group.GroupId, new_stop)
+self.bracket_mgr.update_target(oco_group.GroupId, new_target)
+```
+
+### Reading OCO State
+
+All `BracketGroup` properties from the bracket section apply. Additionally:
+
+```python
+group.IsOco          # True if EntryFilled and EntryTicket is None (no entry leg)
+group.StopTicket     # OrderTicket for the stop leg (None until legs are submitted)
+group.TargetTicket   # OrderTicket for the target leg
+```
+
+---
+
+## How It Works
+
+### Live Trading
+
+1. `PlaceOcoOrder` creates a `BracketGroup` with `EntryFilled=true` and calls
+   `ExecuteOcoSubmission`.
+2. `ExecuteOcoSubmission` submits the take-profit as a LEAN `Limit` order tagged with
+   `AlpacaOcoOrderProperties` (containing the stop price and group ID).
+3. `AlpacaBrokerage.PlaceOrder` detects the OCO properties and calls Alpaca's
+   `.OneCancelsOther()` endpoint, which atomically creates both exit legs.
+4. Alpaca streams order events via WebSocket. On fill of one leg, Alpaca cancels
+   the sibling server-side (OCO cascade).
+
+### Backtesting
+
+1. Same submission path, but `AlpacaBacktestingBrokerage.PlaceOrder` handles it.
+2. The brokerage detects the OCO properties and creates both exit legs via
+   `Algorithm.Transactions.AddOrder`.
+3. On exit leg fill, the brokerage manually cancels the sibling (OCO simulation).
+
+### RescuePartialFill Flow
+
+```
+   bracket entry: partially filled
+              │
+              ▼
+    RescuePartialFill(oldGroupId)
+              │
+    ┌─────────┴──────────┐
+    │ snapshot qty/stop/  │
+    │ target from old     │
+    │ bracket             │
+    └─────────┬──────────┘
+              │
+    CancelBracket(oldGroupId)
+              │
+              ▼
+    [wait for all old legs cancelled]
+        (CheckPendingRescue)
+              │
+              ▼
+    ExecuteOcoSubmission(newGroup)
+              │
+              ▼
+    [OCO stop + target active]
+              │
+         ┌────┴────┐
+      stop fills  target fills
+         │          │
+         ▼          ▼
+    sibling cancelled
+         │
+         ▼
+    IsComplete=true
+```
+
+---
+
+## OCO Constraints
+
+| Constraint | Enforced by |
+|------------|-------------|
+| `takeProfitPrice > stopLossPrice` | `PlaceOcoOrder` validation |
+| `quantity != 0` | `PlaceOcoOrder` validation |
+| `symbol != null` | `PlaceOcoOrder` validation |
+| `stop < target` for updates | `update_stop` / `update_target` (same as brackets) |
+| Old bracket must have partial fills for rescue | `RescuePartialFill` guard |
+| Old bracket entry must NOT be fully filled for rescue | `RescuePartialFill` guard |
+
+---
+
+## OCO Logging
+
+| Pattern | Meaning |
+|---------|---------|
+| `PlaceOcoOrder: takeProfitPrice (X) must be > stopLossPrice (Y)` | Validation rejected — target below stop |
+| `RescuePartialFill: Rescue registered for group X` | Rescue initiated, waiting for old bracket cancel confirmation |
+| `All orders confirmed closed for rescue X. Placing OCO.` | Old bracket fully cancelled, OCO being submitted |
+| `Pending rescue for group X has been waiting...` | Stale rescue warning — cancel confirmation may be lost |
+| `RescuePartialFill: Group X entry is fully filled` | Rescue rejected — entry completed before rescue call (race condition) |
+| `ExecuteOcoSubmission: OCO submission rejected` | LEAN or Alpaca rejected the OCO legs |
+
+---
+
+## Do's and Don'ts (OCO-specific)
+
+### ✅ DO
+
+**Use `PlaceOcoOrder` when you already have a position and want stop/target protection.**
+
+**Use `RescuePartialFill` when a bracket entry partially filled and timed out.**
+It handles the cancel → wait → OCO-submit sequence atomically.
+
+**Track the returned `BracketGroup` the same way you track bracket groups.**
+Replace the old bracket reference with the new OCO group in your tracking dict.
+
+**Call `CheckStalePendingRescues` periodically in live trading.**
+Catches edge cases where the cancel confirmation is lost.
+
+### ❌ DON'T
+
+**Never place an OCO when you don't actually hold the shares.**
+Alpaca rejects OCO exit orders if there's no matching position. The error is:
+`"oco orders must be exit orders"`.
+
+**Never call `RescuePartialFill` after the entry has fully filled.**
+It returns `null`. If the entry completed, the bracket's own exit legs are already
+active — no rescue is needed.
+
+**Never call `RescuePartialFill` twice for the same group.**
+The first call registers the pending rescue. A second call would find
+`EntryFilled=true` on the old group (set by the first rescue) and return `null`.
+
+**Don't assume `RescuePartialFill` quantity matches the final portfolio holdings.**
+The quantity is snapshotted at call time. If rapid partial fills arrive between the
+snapshot and the cancel confirmation, the OCO may cover fewer shares than the actual
+position. In practice this is only a concern with market entries on illiquid stocks —
+stop-limit entries with a timeout (the typical production use case) are not affected.
