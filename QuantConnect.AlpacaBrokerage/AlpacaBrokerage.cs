@@ -1612,11 +1612,15 @@ namespace QuantConnect.Brokerages.Alpaca
                             // if we are used as a brokerage ignore data queue handler updates
                             if (_subscriptionManager != null)
                             {
-                                // resubscribe
+                                // resubscribe legacy aggregator-based subscriptions
                                 var symbols = _subscriptionManager.GetSubscribedSymbols();
                                 Unsubscribe(symbols);
                                 Subscribe(symbols);
                             }
+
+                            // Reconnect direct-feed upstream channels (not tracked by _subscriptionManager)
+                            ReconnectDirectFeeds();
+
                             // let consumers know we are reconnected, avoid lean killing us
                             OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Reconnect, "Reconnected", "Brokerage Reconnected"));
                         }
@@ -1637,6 +1641,8 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         public override void Disconnect()
         {
+            StopQuoteFlushTimer();
+
             _orderStreamingClient?.DisconnectAsync()?.SynchronouslyAwaitTask();
             _equityStreamingClient?.DisconnectAsync()?.SynchronouslyAwaitTask();
             _cryptoStreamingClient?.DisconnectAsync()?.SynchronouslyAwaitTask();
@@ -1645,6 +1651,15 @@ namespace QuantConnect.Brokerages.Alpaca
 
         public override void Dispose()
         {
+            StopQuoteFlushTimer();
+
+            // Dispose all direct-feed enumerators
+            foreach (var kvp in _directFeeds)
+            {
+                kvp.Value.Enumerator.Dispose();
+            }
+            _directFeeds.Clear();
+
             _cancellationTokenSource?.Cancel();
             _cancellationTokenSource?.DisposeSafely();
 

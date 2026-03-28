@@ -15,9 +15,11 @@
 
 using System;
 using QuantConnect.Data;
+using QuantConnect.Logging;
 using QuantConnect.Packets;
 using QuantConnect.Interfaces;
 using System.Collections.Generic;
+using QuantConnect.Brokerages.Alpaca.DirectFeed;
 
 namespace QuantConnect.Brokerages.Alpaca;
 
@@ -36,9 +38,33 @@ public partial class AlpacaBrokerage : IDataQueueHandler
             return null;
         }
 
+        if (UseDirectBarPublishing(dataConfig))
+        {
+            var key = dataConfig.ToKey();
+
+            // Guard against double-subscribe: dispose old feed if it exists
+            if (_directFeeds.TryRemove(key, out var oldFeed))
+            {
+                oldFeed.Enumerator.Dispose();
+                RemoveUpstreamInterest(dataConfig);
+                Log.Trace($"AlpacaBrokerage.Subscribe(): replacing existing DIRECT FEED for {dataConfig.Symbol.Value} {dataConfig.Resolution} {dataConfig.TickType}");
+            }
+
+            var feed = new DirectSubscriptionFeed(dataConfig, newDataAvailableHandler);
+            _directFeeds[key] = feed;
+
+            // Upstream Alpaca channels managed directly — NOT via _subscriptionManager
+            RegisterUpstreamInterest(dataConfig);
+
+            Log.Trace($"AlpacaBrokerage.Subscribe(): DIRECT FEED enabled for {dataConfig.Symbol.Value} {dataConfig.Resolution} {dataConfig.TickType}");
+            return feed.Enumerator;
+        }
+
+        // Legacy path — unchanged
         var enumerator = _aggregator.Add(dataConfig, newDataAvailableHandler);
         _subscriptionManager.Subscribe(dataConfig);
 
+        Log.Trace($"AlpacaBrokerage.Subscribe(): LEGACY AGGREGATOR path for {dataConfig.Symbol.Value} {dataConfig.Resolution} {dataConfig.TickType}");
         return enumerator;
     }
 
@@ -48,6 +74,17 @@ public partial class AlpacaBrokerage : IDataQueueHandler
     /// <param name="dataConfig">Subscription config to be removed</param>
     public void Unsubscribe(SubscriptionDataConfig dataConfig)
     {
+        var key = dataConfig.ToKey();
+        if (_directFeeds.TryRemove(key, out var feed))
+        {
+            // Direct-feed path
+            feed.Enumerator.Dispose();
+            RemoveUpstreamInterest(dataConfig);
+            // Do NOT call _aggregator.Remove — we never registered with it
+            return;
+        }
+
+        // Legacy path
         _subscriptionManager.Unsubscribe(dataConfig);
         _aggregator.Remove(dataConfig);
     }
