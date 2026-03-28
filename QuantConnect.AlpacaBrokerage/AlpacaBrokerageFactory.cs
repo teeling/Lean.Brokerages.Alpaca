@@ -14,6 +14,7 @@
 */
 
 using System;
+using QuantConnect.Api;
 using QuantConnect.Util;
 using QuantConnect.Packets;
 using QuantConnect.Interfaces;
@@ -81,6 +82,17 @@ namespace QuantConnect.Brokerages.Alpaca
                 Composer.Instance.AddPart<IDataQueueHandler>(alpacaBrokerage);
             }
             return alpacaBrokerage;
+        }
+
+        /// <summary>
+        /// Creates a custom brokerage message handler that accepts bracket leg orders.
+        /// The default handler rejects all OnNewBrokerageOrderNotification orders as
+        /// "outside Lean". This override returns a handler that recognizes bracket legs
+        /// by their AlpacaBracketOrderProperties and accepts them.
+        /// </summary>
+        public override IBrokerageMessageHandler CreateBrokerageMessageHandler(IAlgorithm algorithm, AlgorithmNodePacket job, IApi api)
+        {
+            return new AlpacaBrokerageMessageHandler(algorithm, job, api);
         }
 
         /// <summary>
