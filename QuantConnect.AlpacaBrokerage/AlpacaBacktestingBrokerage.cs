@@ -115,7 +115,17 @@ namespace QuantConnect.Brokerages.Alpaca
         public void RegisterManager(BracketOrderManager manager)
         {
             _manager = manager;
+            manager.RegisterBrokerage(this);
             Log.Debug("AlpacaBacktestingBrokerage.RegisterManager: BracketOrderManager registered.");
+        }
+
+        /// <summary>
+        /// Internal forwarding method for BracketOrderManager to emit brokerage messages.
+        /// OnMessage is protected on the Brokerage base class.
+        /// </summary>
+        internal void EmitBrokerageMessage(BrokerageMessageEvent messageEvent)
+        {
+            OnMessage(messageEvent);
         }
 
         #region Order Lifecycle Overrides
@@ -162,6 +172,11 @@ namespace QuantConnect.Brokerages.Alpaca
 
                 _bracketGroups[props.BracketGroupId] = state;
                 _orderToGroup[order.Id] = props.BracketGroupId;
+
+                // Pre-register in the manager's _orderToGroup BEFORE base.PlaceOrder,
+                // because backtest market entries fill synchronously during PlaceOrder,
+                // and ProcessOrderEvent needs this mapping to route the fill event.
+                _manager?.RegisterEntryOrderId(props.BracketGroupId, order.Id);
 
                 Log.Debug($"AlpacaBacktestingBrokerage.PlaceOrder: Registered bracket state for group {props.BracketGroupId}.");
             }
@@ -377,10 +392,21 @@ namespace QuantConnect.Brokerages.Alpaca
                     $"InTracking={_orderToGroup.ContainsKey(evt.OrderId)}");
             }
 
-            // Let the events propagate normally first (fires OrdersStatusChanged)
+            // CRITICAL: ProcessOrderEvent BEFORE base.OnOrderEvents.
+            // This guarantees BracketGroup.State is updated when the strategy's
+            // on_order_event fires. (PRD R5.5)
+            foreach (var e in orderEvents)
+            {
+                if (_orderToGroup.ContainsKey(e.OrderId))
+                {
+                    _manager?.ProcessOrderEvent(e);
+                }
+            }
+
+            // Let the events propagate normally (fires OrdersStatusChanged → strategy on_order_event)
             base.OnOrderEvents(orderEvents);
 
-            // Process each event for bracket tracking
+            // Process each event for bracket lifecycle (exit leg creation, OCO cascade)
             foreach (var e in orderEvents)
             {
                 if (!_orderToGroup.ContainsKey(e.OrderId))
@@ -390,9 +416,6 @@ namespace QuantConnect.Brokerages.Alpaca
 
                 Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Bracket-related event. " +
                     $"OrderId={e.OrderId}, Status={e.Status}, InBaseScan={_inBaseScan}");
-
-                // Forward to BracketOrderManager for state tracking
-                _manager?.ProcessOrderEvent(e);
 
                 if (_inBaseScan)
                 {
@@ -461,14 +484,13 @@ namespace QuantConnect.Brokerages.Alpaca
                     CreateExitLegs(state, e);
 
                     // After creating exit legs, check if CancelBracket was already called
-                    // before the entry filled (cancel-update race: update moved price to market,
-                    // cancel was pending, but fill won the race on the next bar).
-                    // The exit legs are now live — cancel them immediately.
+                    // before the entry filled (cancel-update race). State machine will be
+                    // in Cancelling if a cancel was in flight when the fill arrived.
                     var group = _manager?.GetGroup(state.GroupId);
-                    if (group != null && group.CancelRequested)
+                    if (group != null && group.State == BracketState.Cancelling)
                     {
-                        Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: CancelRequested flag set for group {groupId} " +
-                            $"— cancelling exit legs created after deferred fill.");
+                        Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: Bracket in Cancelling state " +
+                            $"for group {groupId} — cancelling exit legs created after deferred fill.");
                         CancelLegsIfExist(state);
                     }
                 }
@@ -522,18 +544,17 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Creating exit legs for group {state.GroupId}. " +
                 $"ExitQty={exitQty}, StopPrice={state.StopLossPrice}, TargetPrice={state.TakeProfitPrice}");
 
-            // Update the manager's BracketGroup state directly. We can't rely on
-            // ProcessOrderEvent because BacktestingBrokerage fills market orders synchronously
-            // during AddOrder — the fill event fires before PlaceBracketOrder sets _orderToGroup.
+            // State is now managed by the state machine via ProcessOrderEvent.
+            // The entry order fill event has already been processed in OnOrderEvents
+            // (ProcessOrderEvent runs BEFORE base.OnOrderEvents), so BracketGroup.State
+            // is already Protected by the time we get here. No direct field writes needed.
             if (_manager != null)
             {
                 var group = _manager.GetGroup(state.GroupId);
                 if (group != null)
                 {
-                    group.EntryFilled = true;
-                    group.FillPrice = entryFill.FillPrice;
-                    group.FilledQuantity = Math.Abs(state.Quantity);
-                    Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Set EntryFilled=true on manager group. FillPrice={entryFill.FillPrice}");
+                    Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Group state={group.State}, " +
+                        $"FillPrice={group.FillPrice}, FilledQty={group.FilledQuantity}");
                 }
             }
 
