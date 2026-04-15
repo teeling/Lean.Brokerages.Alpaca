@@ -214,6 +214,26 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Debug($"BracketOrderManager.PlaceBracketOrder: Entry ticket ID={entryTicket.OrderId} " +
                 $"registered for group {groupId}. Entry status: {entryTicket.Status}");
 
+            // Handle synchronous rejection: if SubmitOrderRequest triggered an Invalid event
+            // during processing, ProcessOrderEvent may have missed it because _orderToGroup
+            // wasn't populated yet (it's populated at line above, AFTER SubmitOrderRequest).
+            // Detect this by checking the ticket status and transition to Cancelled.
+            // The !IsTerminal guard prevents double-transition if ProcessOrderEvent did handle it.
+            if (entryTicket.Status == OrderStatus.Invalid)
+            {
+                Log.Error($"BracketOrderManager.PlaceBracketOrder: Entry order rejected for group {groupId}. " +
+                    $"Marking bracket as Cancelled.");
+                lock (group.StateLock)
+                {
+                    if (!group.IsTerminal)
+                    {
+                        group.ForceState(BracketState.Cancelled,
+                            $"entry order rejected: {entryTicket.Status}");
+                        OnGroupTerminal(group);
+                    }
+                }
+            }
+
             return group;
         }
 

@@ -2254,23 +2254,6 @@ namespace QuantConnect.Brokerages.Alpaca
 
             var activeBrackets = _bracketManager.ActiveBrackets;
 
-            // Hoist the open orders query outside the loop — one REST call covers all brackets
-            IReadOnlyList<IOrder> allOpenOrders;
-            try
-            {
-                allOpenOrders = await _tradingClient.ListOrdersAsync(new ListOrdersRequest
-                {
-                    OrderStatusFilter = OrderStatusFilter.Open,
-                    RollUpNestedOrders = false,
-                }).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileProtectiveInvariant: " +
-                    $"Failed to list open orders: {ex.Message}");
-                return;
-            }
-
             foreach (var group in activeBrackets)
             {
                 if (group.State != BracketState.Protected) continue;
@@ -2282,18 +2265,24 @@ namespace QuantConnect.Brokerages.Alpaca
                     continue;
                 }
 
-                // Event-triggered guard (R2.5b): skip if exit leg tickets not yet registered
-                if (group.StopTicket == null && group.TargetTicket == null)
+                // Event-triggered guard (R2.5b): skip if EITHER exit leg ticket is not yet
+                // registered. After entry fill or rescue OCO, both legs are registered
+                // asynchronously — there's a brief window where one is null. Checking both
+                // avoids false positives during the registration window.
+                if (group.StopTicket == null || group.TargetTicket == null)
                 {
                     continue;
                 }
 
                 try
                 {
-                    var symbolStr = _symbolMapper.GetBrokerageSymbol(group.Symbol);
-                    var symbolOrders = allOpenOrders.Where(o => o.Symbol == symbolStr).ToList();
-
-                    // Look up the LEAN order to get BrokerId (OrderTicket doesn't expose the Order directly)
+                    // Query Alpaca directly for each leg by its brokerage ID.
+                    // This is the authoritative check — it returns the order regardless of
+                    // whether it's "open", "held", "new", etc. Alpaca bracket stop legs are
+                    // often in "held" status and excluded from ListOrdersAsync(Open), so a
+                    // bulk open-orders query produces false positives. Individual GetOrderAsync
+                    // calls are targeted (one per suspicious leg, max 2 per bracket) and
+                    // return the actual Alpaca-side state.
                     var stopBrokerId = group.StopTicket != null
                         ? _orderProvider.GetOrderById(group.StopTicket.OrderId)?.BrokerId?.LastOrDefault()
                         : null;
@@ -2301,18 +2290,15 @@ namespace QuantConnect.Brokerages.Alpaca
                         ? _orderProvider.GetOrderById(group.TargetTicket.OrderId)?.BrokerId?.LastOrDefault()
                         : null;
 
-                    var hasStop = group.StopTicket?.Status.IsOpen() == true &&
-                                  stopBrokerId != null &&
-                                  symbolOrders.Any(o => o.OrderId.ToString() == stopBrokerId);
-                    var hasTarget = group.TargetTicket?.Status.IsOpen() == true &&
-                                   targetBrokerId != null &&
-                                   symbolOrders.Any(o => o.OrderId.ToString() == targetBrokerId);
+                    var hasStop = await CheckLegExistsAtAlpacaAsync(stopBrokerId, "stop", group);
+                    var hasTarget = await CheckLegExistsAtAlpacaAsync(targetBrokerId, "target", group);
 
                     if (!hasStop || !hasTarget)
                     {
                         Log.Error($"[PLUGIN:PROTECTIVE_INVARIANT] Protected bracket {group.GroupId} " +
                             $"for {group.Symbol.Value} missing protective orders. " +
-                            $"HasStop={hasStop}, HasTarget={hasTarget}. Re-creation needed.");
+                            $"HasStop={hasStop} (brokerId={stopBrokerId}), " +
+                            $"HasTarget={hasTarget} (brokerId={targetBrokerId}).");
 
                         _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT]", new Dictionary<string, object>
                         {
@@ -2325,9 +2311,6 @@ namespace QuantConnect.Brokerages.Alpaca
                         });
 
                         // TODO: Implement protective order re-creation via Alpaca REST PostOrderAsync.
-                        // This requires: creating the order, registering via _provisionalBracketLegOrders
-                        // + OnNewBrokerageOrderNotification, and tagging with client_order_id for
-                        // idempotency. Deferred to the next iteration for careful implementation.
                     }
                 }
                 catch (Exception ex)
@@ -2335,6 +2318,59 @@ namespace QuantConnect.Brokerages.Alpaca
                     Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileProtectiveInvariant: " +
                         $"Error checking group {group.GroupId}: {ex.Message}");
                 }
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a bracket leg exists at Alpaca by querying the individual order.
+        /// Returns true if the order exists and is in a non-terminal status (New, Accepted,
+        /// Held, PartiallyFilled, PendingNew, PendingReplace, PendingCancel — any status
+        /// that means the order is still live or held at Alpaca).
+        /// </summary>
+        private async Task<bool> CheckLegExistsAtAlpacaAsync(string brokerId, string legName, BracketGroup group)
+        {
+            if (string.IsNullOrEmpty(brokerId))
+            {
+                Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: no brokerId in LEAN");
+                return false;
+            }
+
+            if (!Guid.TryParse(brokerId, out var alpacaGuid))
+            {
+                Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: invalid brokerId format: {brokerId}");
+                return false;
+            }
+
+            try
+            {
+                var alpacaOrder = await _tradingClient.GetOrderAsync(alpacaGuid).ConfigureAwait(false);
+                if (alpacaOrder == null)
+                {
+                    return false;
+                }
+
+                // Terminal statuses mean the order is gone
+                var isTerminal = alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Filled ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Canceled ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Expired ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Replaced;
+
+                if (isTerminal)
+                {
+                    Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: " +
+                        $"Alpaca order {alpacaGuid} is terminal ({alpacaOrder.OrderStatus})");
+                    return false;
+                }
+
+                // Order exists and is non-terminal (open, held, pending, etc.)
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // If we can't reach Alpaca, assume the order is there to avoid false alarms
+                Log.Error($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: " +
+                    $"Failed to query Alpaca for {alpacaGuid}: {ex.Message}. Assuming order exists.");
+                return true;
             }
         }
 
