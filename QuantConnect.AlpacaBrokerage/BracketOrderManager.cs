@@ -56,6 +56,16 @@ namespace QuantConnect.Brokerages.Alpaca
         internal Brokerage Brokerage { get; set; }
 
         /// <summary>
+        /// Delegate to check if an order with a given client_order_id already exists at Alpaca.
+        /// Set by the brokerage during manager registration. Used for rescue OCO idempotency:
+        /// before placing a rescue OCO, check if a previous attempt already succeeded at Alpaca
+        /// (e.g., the POST succeeded but the response was lost due to a network error).
+        /// Returns true if ANY order with that client ID exists (open or terminal).
+        /// A terminal order still means "don't place a duplicate."
+        /// </summary>
+        internal Func<string, bool> CheckOrderExistsByClientId { get; set; }
+
+        /// <summary>
         /// All bracket groups, keyed by group ID.
         /// </summary>
         private readonly ConcurrentDictionary<string, BracketGroup> _groups = new();
@@ -302,7 +312,17 @@ namespace QuantConnect.Brokerages.Alpaca
                     return false;
                 }
 
-                if (entryTicket.Status == OrderStatus.New)
+                if (entryTicket.Status == OrderStatus.Invalid)
+                {
+                    // Entry was already rejected — nothing to cancel, go straight to Cancelled
+                    Log.Debug($"BracketOrderManager.CancelBracket: Entry already Invalid for group {groupId}. " +
+                        $"Skipping cancel, transitioning directly to Cancelled.");
+                    group.TryTransition(BracketState.Cancelling, BracketState.Cancelled,
+                        "entry already Invalid, nothing to cancel");
+                    OnGroupTerminal(group);
+                    return true;
+                }
+                else if (entryTicket.Status == OrderStatus.New)
                 {
                     Log.Debug($"BracketOrderManager.CancelBracket: Entry ticket {entryTicket.OrderId} " +
                         $"still in New status for group {groupId}. Setting PendingCancel for deferred retry.");
@@ -701,6 +721,15 @@ namespace QuantConnect.Brokerages.Alpaca
                 return;
             }
 
+            // Guard: ignore events for brackets that are already terminal.
+            // Prevents reconciliation synthetic fills from creating phantom positions.
+            if (group.IsTerminal)
+            {
+                Log.Debug($"BracketOrderManager.ProcessOrderEvent: Ignoring event for terminal group " +
+                    $"{groupId} (state={group.State}). OrderId={e.OrderId}, Status={e.Status}");
+                return;
+            }
+
             Log.Trace($"BracketOrderManager.ProcessOrderEvent: Group {groupId}, " +
                 $"OrderId={e.OrderId}, Status={e.Status}, FillQty={e.FillQuantity}, " +
                 $"FillPrice={e.FillPrice}, State={group.State}");
@@ -964,11 +993,14 @@ namespace QuantConnect.Brokerages.Alpaca
         private void ProcessExitEvent(BracketGroup group, OrderEvent e)
         {
             var legName = (e.OrderId == group.StopTicket?.OrderId) ? "STOP" : "TARGET";
+            decimal rescueQty = 0;
 
             lock (group.StateLock)
             {
                 if (e.Status == OrderStatus.Filled)
                 {
+                    group.ExitFilledQuantity += Math.Abs(e.FillQuantity);
+
                     if (group.State == BracketState.Closed)
                     {
                         // Double fill — both OCO legs filled (extreme volatility race)
@@ -1003,25 +1035,53 @@ namespace QuantConnect.Brokerages.Alpaca
                     }
 
                     Log.Debug($"BracketOrderManager.ProcessExitEvent: {legName} leg FILLED for group {group.GroupId} " +
-                        $"at price {e.FillPrice}. State={group.State}");
+                        $"at price {e.FillPrice}. ExitFilledQty={group.ExitFilledQuantity}. State={group.State}");
                 }
                 else if (e.Status == OrderStatus.PartiallyFilled)
                 {
+                    group.ExitFilledQuantity += Math.Abs(e.FillQuantity);
                     Log.Debug($"BracketOrderManager.ProcessExitEvent: {legName} leg PARTIAL FILL for group {group.GroupId} " +
-                        $"at price {e.FillPrice}. FillQty={e.FillQuantity}.");
+                        $"at price {e.FillPrice}. FillQty={e.FillQuantity}. ExitFilledQty={group.ExitFilledQuantity}");
                 }
                 else if (e.Status == OrderStatus.Canceled)
                 {
                     Log.Debug($"BracketOrderManager.ProcessExitEvent: {legName} leg CANCELLED for group {group.GroupId}.");
 
-                    // If both exit legs are closed and none filled, mark as cancelled
                     var stopClosed = group.StopTicket == null || group.StopTicket.Status.IsClosed();
                     var targetClosed = group.TargetTicket == null || group.TargetTicket.Status.IsClosed();
-                    if (stopClosed && targetClosed && group.State != BracketState.Closed)
+                    if (stopClosed && targetClosed && group.State != BracketState.Closed
+                        && group.State != BracketState.Rescuing)
                     {
-                        group.TryTransitionFrom(BracketState.Cancelled,
-                            "both exit legs closed without fill");
-                        OnGroupTerminal(group);
+                        var remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                        if (remainingQty > 0)
+                        {
+                            // Exit legs cancelled but shares remain unprotected — rescue via standalone OCO.
+                            // This catches the race where entry fills fully during CancelBracket() and
+                            // Alpaca cascades the cancel to the stop+target legs.
+                            Log.Error($"BracketOrderManager.ProcessExitEvent: EXIT CANCEL CASCADE RESCUE for group {group.GroupId}. " +
+                                $"RemainingQty={remainingQty} (entryFilled={Math.Abs(group.FilledQuantity)}, " +
+                                $"exitFilled={group.ExitFilledQuantity}). Transitioning to Rescuing.");
+                            EmitPluginMessage("[PLUGIN:EXIT_CANCEL_RESCUE]", new
+                            {
+                                severity = "critical",
+                                group_id = group.GroupId,
+                                symbol = group.Symbol.Value,
+                                msg = $"Both exit legs cancelled with {remainingQty} shares unprotected. Rescuing.",
+                                remaining_qty = remainingQty,
+                                entry_filled = Math.Abs(group.FilledQuantity),
+                                exit_filled = group.ExitFilledQuantity,
+                            });
+                            group.ForceState(BracketState.Rescuing,
+                                $"exit legs cancelled with {remainingQty} shares unprotected");
+                            rescueQty = remainingQty;
+                        }
+                        else
+                        {
+                            // All shares already exited via partial/full fills before cancel — clean close
+                            group.TryTransitionFrom(BracketState.Cancelled,
+                                "both exit legs closed, all shares accounted for");
+                            OnGroupTerminal(group);
+                        }
                     }
                 }
                 else
@@ -1030,6 +1090,12 @@ namespace QuantConnect.Brokerages.Alpaca
                         $"for group {group.GroupId}");
                 }
             }
+
+            // If transitioned to Rescuing, execute rescue outside the lock (involves REST I/O)
+            if (rescueQty > 0 && group.State == BracketState.Rescuing)
+            {
+                ExecuteRescue(group, rescueQty);
+            }
         }
 
         #endregion
@@ -1037,25 +1103,37 @@ namespace QuantConnect.Brokerages.Alpaca
         #region Internal — Rescue, OCO, Timers
 
         /// <summary>
-        /// Executes a partial fill rescue: places a standalone OCO for the filled shares.
-        /// Called when a bracket with partial fills transitions to Rescuing state.
+        /// Executes a rescue: places a standalone OCO for unprotected shares.
+        /// Called when a bracket transitions to Rescuing state, either from:
+        /// - ProcessEntryCanceled: entry cancelled with partial fills (original path)
+        /// - ProcessExitEvent: exit legs cancelled but shares remain (cancel cascade race fix)
+        /// - ReconcileProtectiveInvariantAsync: invariant checker safety net
         /// </summary>
-        private void ExecuteRescue(BracketGroup group)
+        /// <param name="group">The bracket group to rescue.</param>
+        /// <param name="remainingQtyOverride">
+        /// When provided, overrides the rescue quantity (for exit-leg-cancel cascade where
+        /// some shares may have already exited via partial fills before the cancel).
+        /// When null, uses Math.Abs(group.FilledQuantity) (original behavior for entry-cancel rescues).
+        /// </param>
+        internal void ExecuteRescue(BracketGroup group, decimal? remainingQtyOverride = null)
         {
+            var rescueQty = remainingQtyOverride ?? Math.Abs(group.FilledQuantity);
             Log.Debug($"BracketOrderManager.ExecuteRescue: Initiating rescue for group {group.GroupId}. " +
-                $"FilledQty={group.FilledQuantity}, Stop={group.StopLossPrice}, Target={group.TakeProfitPrice}");
+                $"RescueQty={rescueQty}, FilledQty={group.FilledQuantity}, ExitFilledQty={group.ExitFilledQuantity}, " +
+                $"Stop={group.StopLossPrice}, Target={group.TakeProfitPrice}");
 
             // Register the pending rescue — OCO is placed when all old orders are confirmed closed
             var rescue = new PendingRescue
             {
                 Symbol = group.Symbol,
-                FilledQuantity = Math.Abs(group.FilledQuantity),
+                FilledQuantity = rescueQty,
                 StopLossPrice = group.StopLossPrice,
                 TakeProfitPrice = group.TakeProfitPrice,
                 StopLossLimitPrice = group.StopLossLimitPrice,
                 FillPrice = group.FillPrice ?? 0m,
                 OriginalGroup = group,
                 RequestedAt = DateTime.UtcNow,
+                ClientOrderId = ClientOrderIdGenerator.ForRescueOco(group.GroupId, BracketLegType.TakeProfit),
             };
             _pendingRescues[group.GroupId] = rescue;
 
@@ -1079,8 +1157,12 @@ namespace QuantConnect.Brokerages.Alpaca
 
             if (allClosed)
             {
+                // Atomic remove — only one thread wins. Prevents duplicate OCO placement
+                // when concurrent threads (WS event + timer callback) both reach this point.
+                if (!_pendingRescues.TryRemove(groupId, out rescue))
+                    return;
+
                 Log.Debug($"BracketOrderManager.CheckPendingRescue: All orders confirmed closed for rescue {groupId}. Placing OCO.");
-                _pendingRescues.TryRemove(groupId, out _);
 
                 // Place OCO for the filled shares
                 try
@@ -1102,8 +1184,63 @@ namespace QuantConnect.Brokerages.Alpaca
         private void PlaceRescueOco(PendingRescue rescue)
         {
             var group = rescue.OriginalGroup;
-            // Negate the filled quantity to flatten: long fills (positive) → sell, short fills (negative) → buy
-            var exitQty = -group.FilledQuantity;
+
+            // Idempotency check: verify no order with this client ID already exists at Alpaca.
+            // This prevents duplicate rescue OCOs when concurrent threads or retries race.
+            if (CheckOrderExistsByClientId != null && rescue.ClientOrderId != null)
+            {
+                try
+                {
+                    if (CheckOrderExistsByClientId(rescue.ClientOrderId))
+                    {
+                        // The rescue OCO already exists at Alpaca — position is protected
+                        // (or already exited if the OCO filled). We can't register the
+                        // existing OCO's leg tickets because we don't have the Alpaca order
+                        // details needed to create phantom LEAN orders.
+                        //
+                        // Transition to Cancelled (terminal) to free _symbolToGroup and
+                        // allow new brackets. The existing OCO at Alpaca continues to
+                        // protect the position independently — when its legs fill, the
+                        // WS events will be handled by HandleTradeUpdate's unknown-order
+                        // fallback, and LEAN's portfolio model will correctly reflect
+                        // the position change.
+                        Log.Error($"BracketOrderManager.PlaceRescueOco: Order with ClientId={rescue.ClientOrderId} " +
+                            $"already exists at Alpaca. Skipping duplicate rescue for group {group.GroupId}. " +
+                            $"Transitioning to Cancelled to free symbol.");
+
+                        lock (group.StateLock)
+                        {
+                            if (group.State == BracketState.Rescuing)
+                            {
+                                group.TryTransition(BracketState.Rescuing, BracketState.Cancelled,
+                                    $"rescue OCO already exists at Alpaca (clientId={rescue.ClientOrderId}), " +
+                                    $"releasing bracket tracking — Alpaca OCO continues independently");
+                            }
+                        }
+
+                        EmitPluginMessage("[PLUGIN:RESCUE_DUPLICATE_DETECTED]", new
+                        {
+                            severity = "warning",
+                            group_id = group.GroupId,
+                            symbol = group.Symbol.Value,
+                            msg = $"Rescue OCO already exists at Alpaca (clientId={rescue.ClientOrderId}). " +
+                                  $"Bracket tracking released. OCO continues independently at Alpaca.",
+                        });
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug($"BracketOrderManager.PlaceRescueOco: Client ID pre-flight check failed: {ex.Message}. " +
+                        $"Proceeding with placement for group {group.GroupId}.");
+                }
+            }
+
+            // Use rescue's FilledQuantity (may be overridden for exit-leg-cancel cascade where
+            // some shares already exited via partial fills before the cancel).
+            // Sign follows the entry: long (positive FilledQuantity) → sell (negative), short → buy.
+            var exitQtyAbs = rescue.FilledQuantity;
+            var exitQty = group.FilledQuantity > 0 ? -exitQtyAbs : exitQtyAbs;
             var targetPrice = RoundPrice(rescue.TakeProfitPrice, "rescueTarget");
             var stopPrice = RoundPrice(rescue.StopLossPrice, "rescueStop");
 
@@ -1115,6 +1252,8 @@ namespace QuantConnect.Brokerages.Alpaca
                     ? RoundPrice(rescue.StopLossLimitPrice.Value, "rescueStopLimit")
                     : null,
                 OriginatingManager = this,
+                IsRescueOco = true,
+                ClientOrderId = rescue.ClientOrderId,
             };
 
             var request = new SubmitOrderRequest(
@@ -1310,10 +1449,48 @@ namespace QuantConnect.Brokerages.Alpaca
             group.CancellingTimeoutTimer?.Dispose();
             group.CancellingTimeoutTimer = new System.Threading.Timer(_ =>
             {
-                Log.Debug($"BracketOrderManager.CancellingTimeout: 30s timeout for group {group.GroupId}. " +
-                    $"Cancel ack may have been lost. Layer 1 reconciliation will detect actual state.");
-                // Layer 1 reconciliation handles this — the timer is just a log marker.
-                // In a future enhancement, this could query Alpaca REST directly.
+                lock (group.StateLock)
+                {
+                    if (group.State != BracketState.Cancelling) return;
+
+                    // Only force-terminate if the entry was never accepted by Alpaca (no BrokerId).
+                    // If the entry HAS a BrokerId, Alpaca accepted it and the cancel ack may be
+                    // legitimately delayed — Layer 1 reconciliation will detect actual state.
+                    // Force-terminating a bracket with a BrokerId risks position leaks.
+                    var entryOrder = group.EntryTicket?.OrderId > 0
+                        ? _algorithm.Transactions.GetOrderById(group.EntryTicket.OrderId)
+                        : null;
+                    var hasBrokerId = entryOrder?.BrokerId.Count > 0;
+
+                    if (hasBrokerId)
+                    {
+                        Log.Error($"BracketOrderManager.CancellingTimeout: 30s timeout for group {group.GroupId}. " +
+                            $"Entry has BrokerId — deferring to Layer 1 reconciliation.");
+                        return;
+                    }
+
+                    // Entry was never accepted (rejected or never submitted) — nothing to cancel
+                    if (group.FilledQuantity != 0)
+                    {
+                        Log.Error($"BracketOrderManager.CancellingTimeout: 30s timeout for group {group.GroupId} " +
+                            $"with fills (qty={group.FilledQuantity}) but no BrokerId. Forcing rescue.");
+                        group.ForceState(BracketState.Rescuing,
+                            "cancelling timeout, no BrokerId, has fills — forcing rescue");
+                    }
+                    else
+                    {
+                        Log.Error($"BracketOrderManager.CancellingTimeout: 30s timeout for group {group.GroupId}. " +
+                            $"No BrokerId, no fills. Forcing Cancelled.");
+                        group.ForceState(BracketState.Cancelled,
+                            "cancelling timeout, no BrokerId, no fills — forcing terminal");
+                        OnGroupTerminal(group);
+                    }
+                }
+
+                if (group.State == BracketState.Rescuing)
+                {
+                    ExecuteRescue(group);
+                }
             }, null, 30000, System.Threading.Timeout.Infinite);
         }
 
@@ -1465,6 +1642,13 @@ namespace QuantConnect.Brokerages.Alpaca
             public decimal FillPrice { get; set; }
             public BracketGroup OriginalGroup { get; set; }
             public DateTime RequestedAt { get; set; }
+
+            /// <summary>
+            /// Pre-generated client order ID for rescue OCO idempotency.
+            /// Generated once when the rescue is first created, reused across retries
+            /// to prevent duplicate OCO placement at Alpaca.
+            /// </summary>
+            public string ClientOrderId { get; set; }
         }
 
         #endregion

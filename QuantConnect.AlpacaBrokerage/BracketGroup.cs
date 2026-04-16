@@ -106,7 +106,8 @@ namespace QuantConnect.Brokerages.Alpaca
             [BracketState.Protected] = new HashSet<BracketState>
             {
                 BracketState.Closed,        // exit fill (stop or target hit)
-                BracketState.Cancelled      // both exit legs cancelled without fill (e.g., EOD cancel cascade)
+                BracketState.Cancelled,     // both exit legs cancelled, no shares remaining
+                BracketState.Rescuing       // exit legs cancelled but shares remain — rescue via standalone OCO
             },
             [BracketState.Cancelling] = new HashSet<BracketState>
             {
@@ -117,7 +118,8 @@ namespace QuantConnect.Brokerages.Alpaca
             },
             [BracketState.Rescuing] = new HashSet<BracketState>
             {
-                BracketState.Protected      // OCO placed and confirmed
+                BracketState.Protected,     // OCO placed and confirmed
+                BracketState.Cancelled      // duplicate OCO detected at Alpaca — release tracking
             },
             // Terminal states — no valid transitions out
             [BracketState.Closed] = new HashSet<BracketState>(),
@@ -176,6 +178,13 @@ namespace QuantConnect.Brokerages.Alpaca
         /// In live trading, Alpaca adjusts exit leg quantities to match this value.
         /// </summary>
         public decimal FilledQuantity { get; internal set; }
+
+        /// <summary>
+        /// Cumulative absolute quantity filled across both exit legs (stop + target partial/full fills).
+        /// Used to compute remaining unprotected shares when exit legs are cancelled:
+        /// remainingQty = Math.Abs(FilledQuantity) - ExitFilledQuantity.
+        /// </summary>
+        public decimal ExitFilledQuantity { get; internal set; }
 
         /// <summary>
         /// How many shares have active stop+target orders protecting them.
@@ -305,16 +314,23 @@ namespace QuantConnect.Brokerages.Alpaca
 
         /// <summary>
         /// Client order ID for Layer 2 replacement stop order.
-        /// Format: r-{8charGroupPrefix}-s-{6charNonce}
-        /// Used to prevent duplicate placement via Alpaca REST query.
+        /// Format: l2-{groupId8}-s-{seq}-{nonce6}
+        /// Used to prevent duplicate placement via Alpaca client_order_id lookup.
         /// </summary>
         internal string Layer2StopClientOrderId { get; set; }
 
         /// <summary>
         /// Client order ID for Layer 2 replacement target order.
-        /// Format: r-{8charGroupPrefix}-t-{6charNonce}
+        /// Format: l2-{groupId8}-t-{seq}-{nonce6}
         /// </summary>
         internal string Layer2TargetClientOrderId { get; set; }
+
+        /// <summary>
+        /// Monotonically increasing counter for Layer 2 replacement orders.
+        /// Each replacement attempt for the same leg increments this, ensuring
+        /// unique client_order_ids even across multiple replacement cycles.
+        /// </summary>
+        internal int Layer2ReplacementSeq { get; set; }
 
         // --- Rescue retry (Rescuing state) ---
 
@@ -349,6 +365,13 @@ namespace QuantConnect.Brokerages.Alpaca
         /// checks for the 30-second grace window.
         /// </summary>
         internal DateTime? ProtectedEnteredAt { get; set; }
+
+        /// <summary>
+        /// One-shot guard: true if ReconcileProtectiveInvariantAsync has already
+        /// attempted a rescue for this bracket. Prevents repeated rescue attempts
+        /// on every reconciliation cycle.
+        /// </summary>
+        internal bool InvariantRescueAttempted { get; set; }
 
         // --- Constructor ---
 
@@ -493,7 +516,8 @@ namespace QuantConnect.Brokerages.Alpaca
             var entryInfo = EntryType == OrderType.StopLimit
                 ? $"entry=stop-limit(stop={EntryStopPrice})"
                 : $"entry={EntryType.ToString().ToLower()}";
-            return $"BracketGroup[{GroupId}] {Symbol} {qtyInfo} {entryInfo} " +
+            var g8 = GroupId.Length >= 8 ? GroupId[..8] : GroupId;
+            return $"BracketGroup[{g8}] {Symbol} {qtyInfo} {entryInfo} " +
                    $"stop={StopLossPrice} target={TakeProfitPrice} state={State}";
         }
     }
