@@ -2593,6 +2593,36 @@ namespace QuantConnect.Brokerages.Alpaca
                         $"Error checking group {group.GroupId}: {ex.Message}");
                 }
             }
+
+            // Layer 2b: Detect brackets stuck in Rescuing state with stale pending rescues.
+            // Safety net for cases where CheckPendingRescue missed the window (e.g., the
+            // ticket status was stale when the event-driven check ran, but is now updated).
+            if (isTimerTriggered)
+            {
+                foreach (var group in activeBrackets)
+                {
+                    if (group.State != BracketState.Rescuing) continue;
+
+                    try
+                    {
+                        var pendingRescue = _bracketManager?.GetPendingRescue(group.GroupId);
+                        if (pendingRescue == null) continue;
+
+                        var rescueAge = (DateTime.UtcNow - pendingRescue.RequestedAt).TotalSeconds;
+                        if (rescueAge < 30) continue; // give event-driven path time to complete
+
+                        // Tickets should be fully updated by now (OnOrderEvent ran long ago).
+                        // CheckPendingRescue with no currentEvent falls back to ticket status,
+                        // which is correct here since all events have been fully processed.
+                        _bracketManager?.CheckPendingRescue(group.GroupId, group);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileProtectiveInvariant: " +
+                            $"Error checking stale rescue for group {group.GroupId}: {ex.Message}");
+                    }
+                }
+            }
         }
 
         /// <summary>

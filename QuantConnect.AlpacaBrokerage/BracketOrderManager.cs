@@ -620,6 +620,16 @@ namespace QuantConnect.Brokerages.Alpaca
         public List<BracketGroup> GetAllGroups() =>
             _groups.Values.ToList();
 
+        /// <summary>
+        /// Gets a pending rescue for a group, if one exists.
+        /// Used by ReconcileProtectiveInvariantAsync as a safety net for stale rescues.
+        /// </summary>
+        internal PendingRescue GetPendingRescue(string groupId)
+        {
+            _pendingRescues.TryGetValue(groupId, out var rescue);
+            return rescue;
+        }
+
         #endregion
 
         #region Leg Registration (Called by Brokerages)
@@ -754,7 +764,7 @@ namespace QuantConnect.Brokerages.Alpaca
             ProcessExitEvent(group, e);
 
             // --- Check if this event completes a pending rescue ---
-            CheckPendingRescue(groupId, group);
+            CheckPendingRescue(groupId, group, e);
         }
 
         /// <summary>
@@ -828,7 +838,7 @@ namespace QuantConnect.Brokerages.Alpaca
             }
 
             // --- Check if this entry event completes a pending rescue ---
-            CheckPendingRescue(group.GroupId, group);
+            CheckPendingRescue(group.GroupId, group, e);
         }
 
         /// <summary>
@@ -1047,10 +1057,11 @@ namespace QuantConnect.Brokerages.Alpaca
                 {
                     Log.Debug($"BracketOrderManager.ProcessExitEvent: {legName} leg CANCELLED for group {group.GroupId}.");
 
-                    var stopClosed = group.StopTicket == null || group.StopTicket.Status.IsClosed();
-                    var targetClosed = group.TargetTicket == null || group.TargetTicket.Status.IsClosed();
+                    var stopClosed = IsTicketClosedOrCurrentEvent(group.StopTicket, e);
+                    var targetClosed = IsTicketClosedOrCurrentEvent(group.TargetTicket, e);
                     if (stopClosed && targetClosed && group.State != BracketState.Closed
-                        && group.State != BracketState.Rescuing)
+                        && group.State != BracketState.Rescuing
+                        && group.State != BracketState.Cancelling)
                     {
                         var remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
                         if (remainingQty > 0)
@@ -1142,38 +1153,69 @@ namespace QuantConnect.Brokerages.Alpaca
         }
 
         /// <summary>
+        /// Returns true if the ticket is closed, OR if the current event targets this ticket
+        /// and has a closed status. Accounts for ProcessOrderEvent running before OnOrderEvent
+        /// updates the ticket status.
+        /// </summary>
+        private static bool IsTicketClosedOrCurrentEvent(OrderTicket ticket, OrderEvent currentEvent)
+        {
+            if (ticket == null) return true;
+            if (ticket.Status.IsClosed()) return true;
+            if (currentEvent != null
+                && currentEvent.OrderId == ticket.OrderId
+                && currentEvent.Status.IsClosed())
+                return true;
+            return false;
+        }
+
+        /// <summary>
         /// Checks whether all orders in a bracket group are confirmed closed,
         /// completing a pending rescue. If so, places the OCO order.
         /// </summary>
-        private void CheckPendingRescue(string groupId, BracketGroup group)
+        /// <param name="groupId">The bracket group ID.</param>
+        /// <param name="group">The bracket group.</param>
+        /// <param name="currentEvent">
+        /// The order event currently being processed (optional). When provided, the event's
+        /// order is treated as closed even if the ticket status hasn't been updated yet.
+        /// This is necessary because ProcessOrderEvent runs before OnOrderEvent, so the
+        /// ticket status is stale for the current event.
+        /// </param>
+        internal void CheckPendingRescue(string groupId, BracketGroup group, OrderEvent currentEvent = null)
         {
             if (!_pendingRescues.TryGetValue(groupId, out var rescue))
                 return;
 
             var allClosed =
-                (group.EntryTicket == null || group.EntryTicket.Status.IsClosed()) &&
-                (group.StopTicket == null || group.StopTicket.Status.IsClosed()) &&
-                (group.TargetTicket == null || group.TargetTicket.Status.IsClosed());
+                IsTicketClosedOrCurrentEvent(group.EntryTicket, currentEvent) &&
+                IsTicketClosedOrCurrentEvent(group.StopTicket, currentEvent) &&
+                IsTicketClosedOrCurrentEvent(group.TargetTicket, currentEvent);
 
-            if (allClosed)
+            if (!allClosed)
             {
-                // Atomic remove — only one thread wins. Prevents duplicate OCO placement
-                // when concurrent threads (WS event + timer callback) both reach this point.
-                if (!_pendingRescues.TryRemove(groupId, out rescue))
-                    return;
+                Log.Trace($"BracketOrderManager.CheckPendingRescue: Rescue {groupId} waiting. " +
+                    $"Entry={group.EntryTicket?.Status.ToString() ?? "null"}, " +
+                    $"Stop={group.StopTicket?.Status.ToString() ?? "null"}, " +
+                    $"Target={group.TargetTicket?.Status.ToString() ?? "null"}" +
+                    (currentEvent != null ? $", currentEvent=OrderId:{currentEvent.OrderId}/{currentEvent.Status}" : ""));
+                return;
+            }
 
-                Log.Debug($"BracketOrderManager.CheckPendingRescue: All orders confirmed closed for rescue {groupId}. Placing OCO.");
+            // Atomic remove — only one thread wins. Prevents duplicate OCO placement
+            // when concurrent threads (WS event + timer callback) both reach this point.
+            if (!_pendingRescues.TryRemove(groupId, out rescue))
+                return;
 
-                // Place OCO for the filled shares
-                try
-                {
-                    PlaceRescueOco(rescue);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"BracketOrderManager.CheckPendingRescue: OCO placement failed for group {groupId}: {ex.Message}");
-                    ScheduleRescueRetry(rescue);
-                }
+            Log.Debug($"BracketOrderManager.CheckPendingRescue: All orders confirmed closed for rescue {groupId}. Placing OCO.");
+
+            // Place OCO for the filled shares
+            try
+            {
+                PlaceRescueOco(rescue);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"BracketOrderManager.CheckPendingRescue: OCO placement failed for group {groupId}: {ex.Message}");
+                ScheduleRescueRetry(rescue);
             }
         }
 
@@ -1283,7 +1325,7 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Debug($"BracketOrderManager.PlaceRescueOco: Rescue OCO submitted for group {group.GroupId}. " +
                 $"TargetTicket={targetTicket.OrderId}, Qty={exitQty}");
 
-            // Transition to Protected
+            // Transition to Protected and clean up retry timer
             lock (group.StateLock)
             {
                 if (group.State == BracketState.Rescuing)
@@ -1292,6 +1334,8 @@ namespace QuantConnect.Brokerages.Alpaca
                         $"rescue OCO placed, target={targetTicket.OrderId}");
                 }
             }
+            group.RescueRetryTimer?.Dispose();
+            group.RescueRetryTimer = null;
 
             // Emit rescue complete message for entry logger
             EmitPluginMessage("[PLUGIN:RESCUE_COMPLETE]", new
