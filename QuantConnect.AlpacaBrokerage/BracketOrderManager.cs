@@ -51,7 +51,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Plugin version. Logged at startup by both live and backtesting brokerages
         /// to identify which code produced a given log/backtest.
         /// </summary>
-        public const string PluginVersion = "0.5.0";
+        public const string PluginVersion = "0.5.1";
 
         private readonly IAlgorithm _algorithm;
 
@@ -1099,6 +1099,37 @@ namespace QuantConnect.Brokerages.Alpaca
                             group.TryTransitionFrom(BracketState.Cancelled,
                                 "both exit legs closed, all shares accounted for");
                             OnGroupTerminal(group);
+                        }
+                    }
+                    else if (stopClosed && targetClosed
+                        && group.State == BracketState.Protected
+                        && group.ExitFilledQuantity == 0)
+                    {
+                        // FAST-PATH RESCUE: Both exit legs cancelled in Protected state with
+                        // zero exit fills. This is the cancel-fill race: entry filled during
+                        // Cancelling → Protected, but Alpaca cascade-cancelled exit legs.
+                        // Since no exit leg has filled (ExitFilledQuantity == 0), this is NOT
+                        // a normal OCO exit (which would have ExitFilledQuantity > 0).
+                        var remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                        if (remainingQty > 0)
+                        {
+                            Log.Error($"BracketOrderManager.ProcessExitEvent: PROTECTED CANCEL CASCADE RESCUE " +
+                                $"for group {group.GroupId}. Both exit legs cancelled with zero exit fills. " +
+                                $"RemainingQty={remainingQty} (entryFilled={Math.Abs(group.FilledQuantity)}, " +
+                                $"exitFilled={group.ExitFilledQuantity}).");
+                            EmitPluginMessage("[PLUGIN:PROTECTED_CANCEL_RESCUE]", new
+                            {
+                                severity = "critical",
+                                group_id = group.GroupId,
+                                symbol = group.Symbol.Value,
+                                msg = $"Both exit legs cancelled in Protected with zero exit fills. Rescuing {remainingQty} shares.",
+                                remaining_qty = remainingQty,
+                                entry_filled = Math.Abs(group.FilledQuantity),
+                                exit_filled = group.ExitFilledQuantity,
+                            });
+                            group.TryTransition(BracketState.Protected, BracketState.Rescuing,
+                                $"protected cancel cascade: {remainingQty} shares unprotected, zero exit fills");
+                            rescueQty = remainingQty;
                         }
                     }
                 }

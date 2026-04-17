@@ -57,6 +57,15 @@ namespace QuantConnect.Brokerages.Alpaca
         private EventBasedDataQueueHandlerSubscriptionManager _subscriptionManager;
 
         private ConcurrentDictionary<int, decimal> _orderIdToFillQuantity = new();
+
+        /// <summary>
+        /// Records when a WS fill event closed an order (Filled/Canceled).
+        /// Prevents premature deletion of <see cref="_orderIdToFillQuantity"/> data that
+        /// reconciliation needs to compute delta=0 and avoid phantom fills.
+        /// Entries are swept after 5 minutes by the reconciliation cleanup loop.
+        /// </summary>
+        private readonly ConcurrentDictionary<int, DateTime> _orderFillClosedAt = new();
+
         private BrokerageConcurrentMessageHandler<ITradeUpdate> _messageHandler;
 
         /// <summary>
@@ -1415,8 +1424,10 @@ namespace QuantConnect.Brokerages.Alpaca
 
                 if (newLeanOrderStatus.IsClosed())
                 {
-                    // cleanup
-                    _orderIdToFillQuantity.TryRemove(leanOrder.Id, out _);
+                    // Don't delete fill quantity — reconciliation may still need it to compute
+                    // delta=0 and skip this order. Record close time for deferred cleanup.
+                    // See _orderFillClosedAt doc comment for full rationale.
+                    _orderFillClosedAt[leanOrder.Id] = DateTime.UtcNow;
                 }
 
                 var fee = new OrderFee(new CashAmount(0, Currencies.USD));
@@ -2204,7 +2215,10 @@ namespace QuantConnect.Brokerages.Alpaca
                     // Re-check order status inside the lock — a WS event may have processed
                     // this order between Phase 1 (GetOpenOrders) and Phase 2 (this lock).
                     // If the order is no longer open, skip it to avoid duplicate events.
-                    if (leanOrder.Status.IsClosed())
+                    // NOTE: leanOrder is a Clone() from Phase 1 — its Status field is frozen
+                    // at clone time and won't reflect WS-driven updates. The _orderFillClosedAt
+                    // check catches orders whose WS fill arrived after cloning.
+                    if (leanOrder.Status.IsClosed() || _orderFillClosedAt.ContainsKey(leanOrder.Id))
                     {
                         continue;
                     }
@@ -2302,6 +2316,18 @@ namespace QuantConnect.Brokerages.Alpaca
 
             Log.Trace($"[PLUGIN:RECONCILED] Reconciliation cycle complete: " +
                 $"{leanOpenOrders.Count} orders checked, {discrepancyCount} discrepancies found.");
+
+            // Sweep stale fill-tracking tombstones (entries closed > 5 minutes ago).
+            // This prevents unbounded growth of _orderIdToFillQuantity / _orderFillClosedAt.
+            var tombstoneCutoff = DateTime.UtcNow.AddMinutes(-5);
+            foreach (var kvp in _orderFillClosedAt)
+            {
+                if (kvp.Value < tombstoneCutoff)
+                {
+                    _orderIdToFillQuantity.TryRemove(kvp.Key, out _);
+                    _orderFillClosedAt.TryRemove(kvp.Key, out _);
+                }
+            }
 
             // Run Layer 2 protective invariant (timer-triggered)
             try
