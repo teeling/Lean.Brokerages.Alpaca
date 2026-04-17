@@ -236,6 +236,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 return;
             }
             _isInitialized = true;
+            Log.Trace($"AlpacaBrokerage.Initialize(): Alpaca Bracket Plugin v{BracketOrderManager.PluginVersion}");
             ValidateSubscription();
 
             SecurityKey tradingSecretKey = null;

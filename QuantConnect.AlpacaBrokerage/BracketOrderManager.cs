@@ -47,6 +47,12 @@ namespace QuantConnect.Brokerages.Alpaca
     /// </summary>
     public class BracketOrderManager
     {
+        /// <summary>
+        /// Plugin version. Logged at startup by both live and backtesting brokerages
+        /// to identify which code produced a given log/backtest.
+        /// </summary>
+        public const string PluginVersion = "0.5.0";
+
         private readonly IAlgorithm _algorithm;
 
         /// <summary>
@@ -1061,7 +1067,8 @@ namespace QuantConnect.Brokerages.Alpaca
                     var targetClosed = IsTicketClosedOrCurrentEvent(group.TargetTicket, e);
                     if (stopClosed && targetClosed && group.State != BracketState.Closed
                         && group.State != BracketState.Rescuing
-                        && group.State != BracketState.Cancelling)
+                        && group.State != BracketState.Cancelling
+                        && group.State != BracketState.Protected)
                     {
                         var remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
                         if (remainingQty > 0)

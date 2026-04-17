@@ -104,7 +104,8 @@ namespace QuantConnect.Brokerages.Alpaca
         public AlpacaBacktestingBrokerage(IAlgorithm algorithm)
             : base(algorithm, "Alpaca Backtesting Brokerage")
         {
-            Log.Debug("AlpacaBacktestingBrokerage: Initialized bracket-aware backtesting brokerage.");
+            Log.Debug($"AlpacaBacktestingBrokerage: Initialized bracket-aware backtesting brokerage. " +
+                $"Alpaca Bracket Plugin v{BracketOrderManager.PluginVersion}");
         }
 
         /// <summary>
