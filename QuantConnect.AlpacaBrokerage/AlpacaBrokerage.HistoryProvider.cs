@@ -14,7 +14,10 @@
 */
 
 using System;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Threading;
 using Alpaca.Markets;
 using QuantConnect.Util;
 using QuantConnect.Data;
@@ -29,8 +32,11 @@ namespace QuantConnect.Brokerages.Alpaca;
 
 public partial class AlpacaBrokerage : IBatchHistoryProvider
 {
+    /// <summary>Maximum retry attempts per page for transient Alpaca History API errors.</summary>
+    private const int MaxHistoryRetries = 3;
+
     /// <summary>
-    /// Indicates whether querying recent SIP (Securities Information Processor) data  
+    /// Indicates whether querying recent SIP (Securities Information Processor) data
     /// is restricted due to subscription limitations.
     /// </summary>
     private bool _isSipDataRestricted;
@@ -318,15 +324,35 @@ public partial class AlpacaBrokerage : IBatchHistoryProvider
                 }
             }
 
-            try
+            // Inner retry loop: per-page retry budget for transient errors.
+            // The for-loop counter persists across retries (unlike a var inside do-while
+            // which would reset on continue).
+            for (var retryCount = 0; ; retryCount++)
             {
-                request.Pagination.Size ??= paginationSize;
-                response = callback(request).SynchronouslyAwaitTaskResult();
+                try
+                {
+                    request.Pagination.Size ??= paginationSize;
+                    response = callback(request).SynchronouslyAwaitTaskResult();
+                    break; // success — exit retry loop, proceed to yield
+                }
+                catch (RestClientErrorException ex) when (HandleHistoricalFreeRestrictionException(ex.Message, out var messageType, out var messageText))
+                {
+                    repeatByRestrictException = true;
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, messageType, messageText));
+                    break; // handled — exit retry loop, outer do-while will re-iterate
+                }
+                catch (Exception ex) when (IsTransientHistoryError(ex) && retryCount < MaxHistoryRetries)
+                {
+                    var delay = (retryCount + 1) * 1000; // 1s, 2s, 3s
+                    Log.Trace($"AlpacaBrokerage.History: Transient error on attempt {retryCount + 1}/{MaxHistoryRetries}, " +
+                        $"retrying in {delay}ms: {ex.GetType().Name}: {ex.Message}");
+                    Thread.Sleep(delay);
+                    // continue inner for-loop (retryCount increments)
+                }
             }
-            catch (RestClientErrorException ex) when (HandleHistoricalFreeRestrictionException(ex.Message, out var messageType, out var messageText))
+
+            if (repeatByRestrictException)
             {
-                repeatByRestrictException = true;
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, messageType, messageText));
                 continue;
             }
 
@@ -338,6 +364,29 @@ public partial class AlpacaBrokerage : IBatchHistoryProvider
             yield return response;
             request.Pagination.Token = response.NextPageToken;
         } while (!string.IsNullOrEmpty(request.Pagination.Token) || repeatByRestrictException);
+    }
+
+    /// <summary>
+    /// Returns true if the exception is a transient infrastructure error that should be retried.
+    /// Only matches network/transport errors and HTTP 5xx/429 — NOT business-logic errors.
+    /// </summary>
+    private static bool IsTransientHistoryError(Exception ex)
+    {
+        if (ex is IOException or HttpRequestException or TaskCanceledException)
+            return true;
+
+        if (ex is RestClientErrorException rce)
+        {
+            var msg = rce.Message.ToLowerInvariant();
+            if (msg.Contains("500") || msg.Contains("502") || msg.Contains("503") || msg.Contains("504")
+                || msg.Contains("429") || msg.Contains("too many requests"))
+                return true;
+        }
+
+        if (ex.InnerException != null)
+            return IsTransientHistoryError(ex.InnerException);
+
+        return false;
     }
 
     /// <summary>
