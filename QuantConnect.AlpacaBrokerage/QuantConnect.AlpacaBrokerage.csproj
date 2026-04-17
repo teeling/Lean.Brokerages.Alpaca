@@ -27,6 +27,10 @@
 		<Compile Include="..\..\Lean\Common\Properties\SharedAssemblyInfo.cs" Link="Properties\SharedAssemblyInfo.cs" />
 	</ItemGroup>
 	<ItemGroup>
+		<!-- Local Common project reference for custom interfaces (IBatchHistoryProvider) -->
+		<ProjectReference Include="..\..\Lean\Common\QuantConnect.csproj" />
+	</ItemGroup>
+	<ItemGroup>
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
 		<PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />
 		<!-- Required for AlpacaBacktestingSetupHandler which extends BacktestingSetupHandler -->
