@@ -51,7 +51,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Plugin version. Logged at startup by both live and backtesting brokerages
         /// to identify which code produced a given log/backtest.
         /// </summary>
-        public const string PluginVersion = "0.5.1";
+        public const string PluginVersion = "0.5.2";
 
         private readonly IAlgorithm _algorithm;
 
@@ -870,8 +870,11 @@ namespace QuantConnect.Brokerages.Alpaca
                 case BracketState.Cancelling:
                     // Fill arrived while cancel was in flight — cancel lost the race.
                     // Keep the position and protect it.
-                    group.TryTransition(BracketState.Cancelling, BracketState.Protected,
-                        "full fill arrived during Cancelling — cancel lost race, protecting position");
+                    if (group.TryTransition(BracketState.Cancelling, BracketState.Protected,
+                        "full fill arrived during Cancelling — cancel lost race, protecting position"))
+                    {
+                        group.EnteredProtectedFromCancelling = true;
+                    }
                     group.CancellingTimeoutTimer?.Dispose();
                     group.CancellingTimeoutTimer = null;
                     group.PartialFillTimer?.Dispose();
@@ -1103,6 +1106,7 @@ namespace QuantConnect.Brokerages.Alpaca
                     }
                     else if (stopClosed && targetClosed
                         && group.State == BracketState.Protected
+                        && group.EnteredProtectedFromCancelling
                         && group.ExitFilledQuantity == 0)
                     {
                         // FAST-PATH RESCUE: Both exit legs cancelled in Protected state with

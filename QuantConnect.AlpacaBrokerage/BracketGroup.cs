@@ -373,6 +373,15 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </summary>
         internal bool InvariantRescueAttempted { get; set; }
 
+        /// <summary>
+        /// True if the bracket entered Protected from Cancelling state (cancel-fill race:
+        /// entry filled while CancelBracket was in flight). Used by ProcessExitEvent
+        /// fast-path rescue to distinguish cancel-fill race (needs rescue) from EOD
+        /// Liquidate (must NOT rescue). Only set at the Cancelling → Protected transition
+        /// in ProcessEntryFilled. Never cleared — irrelevant once the group leaves Protected.
+        /// </summary>
+        internal bool EnteredProtectedFromCancelling { get; set; }
+
         // --- Constructor ---
 
         /// <summary>
