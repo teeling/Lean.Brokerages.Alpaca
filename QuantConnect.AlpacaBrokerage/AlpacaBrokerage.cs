@@ -1254,7 +1254,11 @@ namespace QuantConnect.Brokerages.Alpaca
                     var ticket = _orderProvider.GetOrderTicket(leanOrder.Id);
                     if (ticket != null)
                     {
-                        // RegisterLegTicket is idempotent — it's fine to call multiple times
+                        // RegisterLegTicket no-ops if the group already holds a ticket with
+                        // a higher LEAN OrderId (stale-overwrite guard). Safe to call on
+                        // duplicate WS events — this call runs BEFORE the dedup gate below,
+                        // so the guard is the only thing that prevents a stale cancel event
+                        // for an old leg from overwriting a freshly-rescued ticket.
                         _bracketManager.RegisterLegTicket(bracketLegInfo.BracketGroupId, bracketLegInfo.LegType, ticket);
                     }
                 }
@@ -1352,6 +1356,29 @@ namespace QuantConnect.Brokerages.Alpaca
                             }
 
                             OnOrderEvent(statusEvent);
+
+                            // --- Bracket leg mapping cleanup on terminal events ---
+                            // Once a leg reaches a terminal state (Canceled, Rejected,
+                            // Expired, DoneForDay), further WS events for the same Alpaca
+                            // order ID are duplicates / late replays. Remove the mapping
+                            // so those duplicates don't classify as bracket legs at the
+                            // top of HandleTradeUpdate and trigger a stale RegisterLegTicket
+                            // call at line 1258 BEFORE the dedup gate suppresses them.
+                            //
+                            // Replaced is explicitly excluded — the remap block at line
+                            // 1321 has already swapped the entry to the new Alpaca ID.
+                            if (isBracketLeg
+                                && obj.Event != TradeEvent.Replaced
+                                && newLeanOrderStatus.IsClosed())
+                            {
+                                if (_bracketLegMapping.TryRemove(obj.Order.OrderId, out _))
+                                {
+                                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                        $"Removed terminal bracket-leg mapping. AlpacaId={obj.Order.OrderId}, " +
+                                        $"GroupId={bracketLegInfo.BracketGroupId}, LegType={bracketLegInfo.LegType}, " +
+                                        $"Event={obj.Event}.");
+                                }
+                            }
 
                             // Safety-net cleanup: when a bracket group becomes terminal,
                             // sweep provisional entries for any remaining legs of this group.

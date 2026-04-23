@@ -51,7 +51,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Plugin version. Logged at startup by both live and backtesting brokerages
         /// to identify which code produced a given log/backtest.
         /// </summary>
-        public const string PluginVersion = "0.5.3";
+        public const string PluginVersion = "0.5.4";
 
         private readonly IAlgorithm _algorithm;
 
@@ -658,15 +658,39 @@ namespace QuantConnect.Brokerages.Alpaca
                 return;
             }
 
+            // Stale-overwrite guard: if the group already holds a ticket with a
+            // strictly higher LEAN OrderId, treat the incoming ticket as stale
+            // and skip. LEAN's SecurityTransactionManager.GetIncrementOrderId
+            // uses Interlocked.Increment so OrderIds are monotonically
+            // increasing within an algorithm run — a newer ticket is always
+            // higher. This defends against the partial-fill-rescue race where
+            // a duplicate Alpaca WS cancel event for the original leg arrives
+            // AFTER the rescue has assigned a new ticket, and HandleTradeUpdate
+            // invokes RegisterLegTicket with the stale ticket before the
+            // duplicate is suppressed by the dedup gate.
             switch (legType)
             {
                 case BracketLegType.StopLoss:
+                    if (group.StopTicket != null && group.StopTicket.OrderId > ticket.OrderId)
+                    {
+                        Log.Debug($"BracketOrderManager.RegisterLegTicket: Skipping stale StopLoss " +
+                            $"ticket {ticket.OrderId} for group {groupId} — current ticket " +
+                            $"{group.StopTicket.OrderId} is newer.");
+                        return;
+                    }
                     group.StopTicket = ticket;
                     Log.Debug($"BracketOrderManager.RegisterLegTicket: Registered StopLoss leg " +
                         $"ticket {ticket.OrderId} for group {groupId}");
                     break;
 
                 case BracketLegType.TakeProfit:
+                    if (group.TargetTicket != null && group.TargetTicket.OrderId > ticket.OrderId)
+                    {
+                        Log.Debug($"BracketOrderManager.RegisterLegTicket: Skipping stale TakeProfit " +
+                            $"ticket {ticket.OrderId} for group {groupId} — current ticket " +
+                            $"{group.TargetTicket.OrderId} is newer.");
+                        return;
+                    }
                     group.TargetTicket = ticket;
                     Log.Debug($"BracketOrderManager.RegisterLegTicket: Registered TakeProfit leg " +
                         $"ticket {ticket.OrderId} for group {groupId}");
