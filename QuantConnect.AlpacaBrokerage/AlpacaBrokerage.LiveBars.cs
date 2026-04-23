@@ -193,7 +193,9 @@ public partial class AlpacaBrokerage
         streamingClient.SubscribeAsync(barSubscription).ConfigureAwait(false).GetAwaiter().GetResult();
         state.BarSubscription = barSubscription;
 
-        Log.Trace($"AlpacaBrokerage.LiveBars: subscribed upstream minute bars for {state.AlpacaSymbol}");
+        // Routine subscription lifecycle — demoted from Trace to Debug (paired
+        // with the Subscribe() log). See comment in DataQueueHandler.Subscribe().
+        Log.Debug($"AlpacaBrokerage.LiveBars: subscribed upstream minute bars for {state.AlpacaSymbol}");
     }
 
     private void UnsubscribeUpstreamBars(EquityLiveSymbolState state)
@@ -225,7 +227,9 @@ public partial class AlpacaBrokerage
         streamingClient.SubscribeAsync(quoteSubscription).ConfigureAwait(false).GetAwaiter().GetResult();
         state.QuoteSubscription = quoteSubscription;
 
-        Log.Trace($"AlpacaBrokerage.LiveBars: subscribed upstream quotes for {state.AlpacaSymbol}");
+        // Routine subscription lifecycle — demoted from Trace to Debug. See
+        // comment in DataQueueHandler.Subscribe() for rationale.
+        Log.Debug($"AlpacaBrokerage.LiveBars: subscribed upstream quotes for {state.AlpacaSymbol}");
     }
 
     private void UnsubscribeUpstreamQuotes(EquityLiveSymbolState state)

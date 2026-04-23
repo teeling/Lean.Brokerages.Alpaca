@@ -1411,7 +1411,10 @@ namespace QuantConnect.Brokerages.Alpaca
                         // Skip this event to avoid flooding logs
                         return;
                     default:
-                        Log.Trace($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}.Event: {obj.Event}. TradeUpdate: {obj}");
+                        // No log here: the full TradeUpdate payload was already
+                        // logged at the top of HandleTradeUpdate (line ~1187),
+                        // and that message contains obj.Event. Re-emitting the
+                        // same data with an "Event:" prefix is redundant.
                         return;
                 }
 
@@ -2525,10 +2528,55 @@ namespace QuantConnect.Brokerages.Alpaca
 
                     if (!hasStop || !hasTarget)
                     {
-                        Log.Error($"[PLUGIN:PROTECTIVE_INVARIANT] Protected bracket {group.GroupId} " +
+                        // Decide log severity based on whether this is the
+                        // actionable case or a known-noise case.
+                        //
+                        //   * Both legs missing AND shares still exposed
+                        //     (remainingQty > 0) → genuine protective-invariant
+                        //     failure; we log ERROR and kick off a rescue.
+                        //
+                        //   * Both legs missing AND remainingQty <= 0 → the
+                        //     trade already completed fully (exit filled then
+                        //     OCO cancelled its sibling, and both show up
+                        //     terminal on the next invariant scan). The
+                        //     position is already closed — pure noise.
+                        //
+                        //   * Single leg missing → normal OCO cascade
+                        //     mid-flight: one exit is filling/just-filled,
+                        //     Alpaca cancels the sibling. The surviving leg
+                        //     still protects the position while the fill
+                        //     completes. Pure noise.
+                        //
+                        // Noise cases: demote to Trace so the main log stays
+                        // clean, but still emit the plugin message so ops /
+                        // downstream subscribers can see the event if they
+                        // want to. Plugin-message severity is dropped to
+                        // "info" for these cases (was "warning").
+                        decimal currentRemainingQtyForLog;
+                        lock (group.StateLock)
+                        {
+                            currentRemainingQtyForLog =
+                                Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                        }
+                        bool isBothMissing = !hasStop && !hasTarget;
+                        bool isActionable = isBothMissing && currentRemainingQtyForLog > 0;
+                        string invariantSummary =
+                            $"[PLUGIN:PROTECTIVE_INVARIANT] Protected bracket {group.GroupId} " +
                             $"for {group.Symbol.Value} missing protective orders. " +
                             $"HasStop={hasStop} (brokerId={stopBrokerId}), " +
-                            $"HasTarget={hasTarget} (brokerId={targetBrokerId}).");
+                            $"HasTarget={hasTarget} (brokerId={targetBrokerId}). " +
+                            $"RemainingQty={currentRemainingQtyForLog}.";
+                        if (isActionable)
+                        {
+                            Log.Error(invariantSummary);
+                        }
+                        else
+                        {
+                            // Known-noise path: OCO cascade mid-flight or
+                            // trade already closed. Keep a Trace breadcrumb
+                            // so the sequence is still auditable post-hoc.
+                            Log.Trace(invariantSummary);
+                        }
 
                         if (!hasStop && !hasTarget)
                         {
@@ -2581,14 +2629,22 @@ namespace QuantConnect.Brokerages.Alpaca
 
                             if (!transitioned)
                             {
-                                // Either conditions not met or remainingQty == 0 — warn only
+                                // Either conditions not met or remainingQty == 0.
                                 lock (group.StateLock)
                                 {
                                     remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
                                 }
+                                // severity: "info" when the trade is already
+                                // closed (remainingQty == 0) — pure noise
+                                // from the invariant's perspective.
+                                // "warning" when there ARE shares but we
+                                // didn't transition (e.g. age below threshold,
+                                // or rescue already attempted) — that's still
+                                // operator-visible.
+                                string severity = remainingQty <= 0 ? "info" : "warning";
                                 _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT]", new Dictionary<string, object>
                                 {
-                                    ["severity"] = "warning",
+                                    ["severity"] = severity,
                                     ["group_id"] = group.GroupId,
                                     ["symbol"] = group.Symbol.Value,
                                     ["msg"] = $"Both legs missing. RemainingQty={remainingQty}, " +
@@ -2598,13 +2654,15 @@ namespace QuantConnect.Brokerages.Alpaca
                         }
                         else
                         {
-                            // Only one leg missing — warn but don't rescue.
-                            // The surviving leg still protects the position (e.g., target partially
-                            // filling causes Alpaca to cancel the stop via OCO cascade — this is
-                            // normal and the target will eventually close the position).
+                            // Only one leg missing — don't rescue. The surviving leg still
+                            // protects the position. Almost always this is a normal OCO
+                            // cascade mid-flight: one exit is filling (or just filled) and
+                            // Alpaca cancelled its sibling. severity="info" to reflect
+                            // that — real ops intervention is only needed when BOTH legs
+                            // are missing AND shares remain exposed.
                             _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT]", new Dictionary<string, object>
                             {
-                                ["severity"] = "warning",
+                                ["severity"] = "info",
                                 ["group_id"] = group.GroupId,
                                 ["symbol"] = group.Symbol.Value,
                                 ["msg"] = $"Single leg missing. HasStop={hasStop}, HasTarget={hasTarget}",

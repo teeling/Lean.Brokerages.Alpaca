@@ -51,7 +51,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Plugin version. Logged at startup by both live and backtesting brokerages
         /// to identify which code produced a given log/backtest.
         /// </summary>
-        public const string PluginVersion = "0.5.2";
+        public const string PluginVersion = "0.5.3";
 
         private readonly IAlgorithm _algorithm;
 
@@ -1114,16 +1114,25 @@ namespace QuantConnect.Brokerages.Alpaca
                         // Cancelling → Protected, but Alpaca cascade-cancelled exit legs.
                         // Since no exit leg has filled (ExitFilledQuantity == 0), this is NOT
                         // a normal OCO exit (which would have ExitFilledQuantity > 0).
+                        //
+                        // This is the automatic-recovery path — we detect the unprotected
+                        // shares and place a standalone OCO below. It's a *successful*
+                        // rescue mechanism, not a failure. Logging at Trace level and
+                        // emitting the plugin message with severity=warning keeps the
+                        // event visible for ops review without raising an ERROR in the
+                        // main log (which gets parsed as a failure by log-health checks).
+                        // If the rescue itself fails, that WILL log as an error further
+                        // down the rescue pipeline.
                         var remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
                         if (remainingQty > 0)
                         {
-                            Log.Error($"BracketOrderManager.ProcessExitEvent: PROTECTED CANCEL CASCADE RESCUE " +
+                            Log.Trace($"BracketOrderManager.ProcessExitEvent: PROTECTED CANCEL CASCADE RESCUE " +
                                 $"for group {group.GroupId}. Both exit legs cancelled with zero exit fills. " +
                                 $"RemainingQty={remainingQty} (entryFilled={Math.Abs(group.FilledQuantity)}, " +
-                                $"exitFilled={group.ExitFilledQuantity}).");
+                                $"exitFilled={group.ExitFilledQuantity}). Rescuing.");
                             EmitPluginMessage("[PLUGIN:PROTECTED_CANCEL_RESCUE]", new
                             {
-                                severity = "critical",
+                                severity = "warning",
                                 group_id = group.GroupId,
                                 symbol = group.Symbol.Value,
                                 msg = $"Both exit legs cancelled in Protected with zero exit fills. Rescuing {remainingQty} shares.",

@@ -56,7 +56,12 @@ public partial class AlpacaBrokerage : IDataQueueHandler
             // Upstream Alpaca channels managed directly — NOT via _subscriptionManager
             RegisterUpstreamInterest(dataConfig);
 
-            Log.Trace($"AlpacaBrokerage.Subscribe(): DIRECT FEED enabled for {dataConfig.Symbol.Value} {dataConfig.Resolution} {dataConfig.TickType}");
+            // Routine subscription lifecycle — demoted from Trace to Debug to reduce
+            // log noise. With a screener rotating ~15 symbols per 2-min cycle and
+            // 2 subscriptions per symbol (Trade + Quote), this fires ~4x per symbol
+            // per rotation. Re-enable via LEAN's log-level config when debugging
+            // subscription issues specifically.
+            Log.Debug($"AlpacaBrokerage.Subscribe(): DIRECT FEED enabled for {dataConfig.Symbol.Value} {dataConfig.Resolution} {dataConfig.TickType}");
             return feed.Enumerator;
         }
 
