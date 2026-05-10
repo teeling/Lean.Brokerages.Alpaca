@@ -51,7 +51,7 @@ namespace QuantConnect.Brokerages.Alpaca
         /// Plugin version. Logged at startup by both live and backtesting brokerages
         /// to identify which code produced a given log/backtest.
         /// </summary>
-        public const string PluginVersion = "0.5.4";
+        public const string PluginVersion = "0.5.5";
 
         private readonly IAlgorithm _algorithm;
 
