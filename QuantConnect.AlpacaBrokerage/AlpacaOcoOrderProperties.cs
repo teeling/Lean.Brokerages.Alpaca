@@ -47,6 +47,19 @@ namespace QuantConnect.Brokerages.Alpaca
         public decimal? StopLossLimitPrice { get; set; }
 
         /// <summary>
+        /// True if this OCO is a rescue order for a partially-filled bracket.
+        /// Used to generate the correct client_order_id prefix (rco vs oco).
+        /// </summary>
+        public bool IsRescueOco { get; set; }
+
+        /// <summary>
+        /// Pre-assigned client order ID for idempotent submission.
+        /// If set, the brokerage uses this instead of generating a new one.
+        /// Used by rescue OCO retries to ensure the same client ID across attempts.
+        /// </summary>
+        public string ClientOrderId { get; set; }
+
+        /// <summary>
         /// Reference to the <see cref="BracketOrderManager"/> that created this OCO order.
         /// Used by the brokerage to auto-register the manager on first OCO order.
         /// </summary>

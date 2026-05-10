@@ -104,7 +104,7 @@ namespace QuantConnect.Brokerages.Alpaca
         public AlpacaBacktestingBrokerage(IAlgorithm algorithm)
             : base(algorithm, "Alpaca Backtesting Brokerage")
         {
-            Log.Debug("AlpacaBacktestingBrokerage: Initialized bracket-aware backtesting brokerage.");
+            Log.Trace($"AlpacaBacktestingBrokerage: Alpaca Bracket Plugin v{BracketOrderManager.PluginVersion}");
         }
 
         /// <summary>
@@ -115,7 +115,17 @@ namespace QuantConnect.Brokerages.Alpaca
         public void RegisterManager(BracketOrderManager manager)
         {
             _manager = manager;
+            manager.RegisterBrokerage(this);
             Log.Debug("AlpacaBacktestingBrokerage.RegisterManager: BracketOrderManager registered.");
+        }
+
+        /// <summary>
+        /// Internal forwarding method for BracketOrderManager to emit brokerage messages.
+        /// OnMessage is protected on the Brokerage base class.
+        /// </summary>
+        internal void EmitBrokerageMessage(BrokerageMessageEvent messageEvent)
+        {
+            OnMessage(messageEvent);
         }
 
         #region Order Lifecycle Overrides
@@ -162,6 +172,11 @@ namespace QuantConnect.Brokerages.Alpaca
 
                 _bracketGroups[props.BracketGroupId] = state;
                 _orderToGroup[order.Id] = props.BracketGroupId;
+
+                // Pre-register in the manager's _orderToGroup BEFORE base.PlaceOrder,
+                // because backtest market entries fill synchronously during PlaceOrder,
+                // and ProcessOrderEvent needs this mapping to route the fill event.
+                _manager?.RegisterEntryOrderId(props.BracketGroupId, order.Id);
 
                 Log.Debug($"AlpacaBacktestingBrokerage.PlaceOrder: Registered bracket state for group {props.BracketGroupId}.");
             }
@@ -377,10 +392,21 @@ namespace QuantConnect.Brokerages.Alpaca
                     $"InTracking={_orderToGroup.ContainsKey(evt.OrderId)}");
             }
 
-            // Let the events propagate normally first (fires OrdersStatusChanged)
+            // CRITICAL: ProcessOrderEvent BEFORE base.OnOrderEvents.
+            // This guarantees BracketGroup.State is updated when the strategy's
+            // on_order_event fires. (PRD R5.5)
+            foreach (var e in orderEvents)
+            {
+                if (_orderToGroup.ContainsKey(e.OrderId))
+                {
+                    _manager?.ProcessOrderEvent(e);
+                }
+            }
+
+            // Let the events propagate normally (fires OrdersStatusChanged → strategy on_order_event)
             base.OnOrderEvents(orderEvents);
 
-            // Process each event for bracket tracking
+            // Process each event for bracket lifecycle (exit leg creation, OCO cascade)
             foreach (var e in orderEvents)
             {
                 if (!_orderToGroup.ContainsKey(e.OrderId))
@@ -391,11 +417,39 @@ namespace QuantConnect.Brokerages.Alpaca
                 Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Bracket-related event. " +
                     $"OrderId={e.OrderId}, Status={e.Status}, InBaseScan={_inBaseScan}");
 
-                // Forward to BracketOrderManager for state tracking
-                _manager?.ProcessOrderEvent(e);
-
                 if (_inBaseScan)
                 {
+                    // CRITICAL — same-bar OCO double-fill prevention.
+                    //
+                    // base.Scan() iterates pending orders one at a time and fires
+                    // OnOrderEvents per order. When a single bar's range straddles BOTH
+                    // the stop and the target prices (e.g., a $1 bar range vs. a $0.97
+                    // bracket width on a $540 ETF), both legs would evaluate to a fill
+                    // in the SAME Scan() call if we waited for ProcessDeferredBracketEvents
+                    // to perform the OCO cancel. The result would be two exit fills
+                    // against one entry → residual reversed position.
+                    //
+                    // Fix: when an exit-leg fill arrives mid-scan, synchronously cancel
+                    // the OCO sibling now. This sets sibling.Status = Canceled before
+                    // base.Scan()'s iteration reaches it; the loop's
+                    // `order.Status.IsClosed()` guard then skips it.
+                    //
+                    // Safe to call into base.CancelOrder mid-scan because:
+                    //   - The underlying `lock(_needsScanLock)` is re-entrant (Monitor).
+                    //   - base.Scan() iterates a materialized snapshot, so removing the
+                    //     sibling from _pending does not corrupt iteration.
+                    //   - The cascaded cancel event re-enters OnOrderEvents as a new list
+                    //     (no aliasing) and is deferred normally; ProcessOrderEvent's
+                    //     terminal-state guard prevents BracketGroup churn.
+                    //
+                    // Entry fills are NOT handled here — they are deferred so exit-leg
+                    // creation (via Algorithm.Transactions.AddOrder) happens cleanly
+                    // after the scan releases.
+                    if (e.Status == OrderStatus.Filled)
+                    {
+                        CancelOcoSiblingSynchronously(e);
+                    }
+
                     // Defer processing until after Scan() releases locks
                     _deferredBracketEvents.Enqueue(e);
                     Log.Trace($"AlpacaBacktestingBrokerage.OnOrderEvents: Deferred bracket event for " +
@@ -461,14 +515,13 @@ namespace QuantConnect.Brokerages.Alpaca
                     CreateExitLegs(state, e);
 
                     // After creating exit legs, check if CancelBracket was already called
-                    // before the entry filled (cancel-update race: update moved price to market,
-                    // cancel was pending, but fill won the race on the next bar).
-                    // The exit legs are now live — cancel them immediately.
+                    // before the entry filled (cancel-update race). State machine will be
+                    // in Cancelling if a cancel was in flight when the fill arrived.
                     var group = _manager?.GetGroup(state.GroupId);
-                    if (group != null && group.CancelRequested)
+                    if (group != null && group.State == BracketState.Cancelling)
                     {
-                        Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: CancelRequested flag set for group {groupId} " +
-                            $"— cancelling exit legs created after deferred fill.");
+                        Log.Debug($"AlpacaBacktestingBrokerage.ProcessBracketEvent: Bracket in Cancelling state " +
+                            $"for group {groupId} — cancelling exit legs created after deferred fill.");
                         CancelLegsIfExist(state);
                     }
                 }
@@ -522,18 +575,17 @@ namespace QuantConnect.Brokerages.Alpaca
             Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Creating exit legs for group {state.GroupId}. " +
                 $"ExitQty={exitQty}, StopPrice={state.StopLossPrice}, TargetPrice={state.TakeProfitPrice}");
 
-            // Update the manager's BracketGroup state directly. We can't rely on
-            // ProcessOrderEvent because BacktestingBrokerage fills market orders synchronously
-            // during AddOrder — the fill event fires before PlaceBracketOrder sets _orderToGroup.
+            // State is now managed by the state machine via ProcessOrderEvent.
+            // The entry order fill event has already been processed in OnOrderEvents
+            // (ProcessOrderEvent runs BEFORE base.OnOrderEvents), so BracketGroup.State
+            // is already Protected by the time we get here. No direct field writes needed.
             if (_manager != null)
             {
                 var group = _manager.GetGroup(state.GroupId);
                 if (group != null)
                 {
-                    group.EntryFilled = true;
-                    group.FillPrice = entryFill.FillPrice;
-                    group.FilledQuantity = Math.Abs(state.Quantity);
-                    Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Set EntryFilled=true on manager group. FillPrice={entryFill.FillPrice}");
+                    Log.Trace($"AlpacaBacktestingBrokerage.CreateExitLegs: Group state={group.State}, " +
+                        $"FillPrice={group.FillPrice}, FilledQty={group.FilledQuantity}");
                 }
             }
 
@@ -674,6 +726,58 @@ namespace QuantConnect.Brokerages.Alpaca
             var stopTicket = Algorithm.Transactions.AddOrder(stopRequest);
             Log.Debug($"AlpacaBacktestingBrokerage.CreateOcoStopLeg: Stop leg submitted for group {state.GroupId}. " +
                 $"OrderId={stopTicket.OrderId}, Status={stopTicket.Status}");
+        }
+
+        /// <summary>
+        /// When an exit-leg FILL event arrives mid-scan, this synchronously cancels the
+        /// OCO sibling so base.Scan()'s next iteration (which holds a snapshot of the
+        /// pending orders) will skip it via the loop's `order.Status.IsClosed()` guard.
+        ///
+        /// Why this exists: a single 1-min bar whose range exceeds the stop-to-target
+        /// width would otherwise fill BOTH legs in the same Scan() call, leaving a
+        /// residual position equal to the exit quantity (entry was +1, exit fills -2).
+        /// See project_docs/2026-05-08_bugfix_todo.md for the original investigation.
+        ///
+        /// No-op when:
+        ///   - The fill is for a non-exit order (entry, OCO with no sibling registered yet, etc.).
+        ///   - The sibling order id is 0 (not yet registered).
+        ///   - The sibling is already closed (handled by CancelLegIfOpen).
+        /// </summary>
+        private void CancelOcoSiblingSynchronously(OrderEvent exitFillEvent)
+        {
+            if (!_orderToGroup.TryGetValue(exitFillEvent.OrderId, out var groupId))
+            {
+                return;
+            }
+            if (!_bracketGroups.TryGetValue(groupId, out var state))
+            {
+                return;
+            }
+
+            int siblingId;
+            string filledLeg;
+            if (exitFillEvent.OrderId == state.StopOrderId && state.TargetOrderId != 0)
+            {
+                siblingId = state.TargetOrderId;
+                filledLeg = "stop";
+            }
+            else if (exitFillEvent.OrderId == state.TargetOrderId && state.StopOrderId != 0)
+            {
+                siblingId = state.StopOrderId;
+                filledLeg = "target";
+            }
+            else
+            {
+                // Fill is for the entry order, or the sibling leg has not been registered
+                // yet — nothing to cancel.
+                return;
+            }
+
+            Log.Debug($"AlpacaBacktestingBrokerage.CancelOcoSiblingSynchronously: Mid-scan {filledLeg} " +
+                $"FILL for group {groupId} at price {exitFillEvent.FillPrice}. " +
+                $"Synchronously cancelling sibling OrderId={siblingId} to prevent same-bar OCO double-fill.");
+
+            CancelLegIfOpen(siblingId);
         }
 
         /// <summary>

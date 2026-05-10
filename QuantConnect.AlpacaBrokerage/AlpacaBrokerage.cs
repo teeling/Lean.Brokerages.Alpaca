@@ -57,6 +57,15 @@ namespace QuantConnect.Brokerages.Alpaca
         private EventBasedDataQueueHandlerSubscriptionManager _subscriptionManager;
 
         private ConcurrentDictionary<int, decimal> _orderIdToFillQuantity = new();
+
+        /// <summary>
+        /// Records when a WS fill event closed an order (Filled/Canceled).
+        /// Prevents premature deletion of <see cref="_orderIdToFillQuantity"/> data that
+        /// reconciliation needs to compute delta=0 and avoid phantom fills.
+        /// Entries are swept after 5 minutes by the reconciliation cleanup loop.
+        /// </summary>
+        private readonly ConcurrentDictionary<int, DateTime> _orderFillClosedAt = new();
+
         private BrokerageConcurrentMessageHandler<ITradeUpdate> _messageHandler;
 
         /// <summary>
@@ -118,6 +127,12 @@ namespace QuantConnect.Brokerages.Alpaca
         // --- Bracket order support ---
 
         /// <summary>
+        /// Reconciliation timer — polls Alpaca REST every 60s to detect and correct
+        /// state divergence from missed WebSocket events. Live only.
+        /// </summary>
+        private Timer _reconciliationTimer;
+
+        /// <summary>
         /// Maps Alpaca leg order GUIDs to bracket leg info for routing trade updates
         /// to the correct LEAN orders and managing leg lifecycle.
         /// </summary>
@@ -137,7 +152,39 @@ namespace QuantConnect.Brokerages.Alpaca
         public void RegisterManager(BracketOrderManager manager)
         {
             _bracketManager = manager;
+            manager.RegisterBrokerage(this);
+
+            // Wire up the client_order_id lookup delegate for rescue OCO idempotency.
+            // The manager uses this to check if a rescue OCO was already placed at Alpaca
+            // before attempting to place a potentially duplicate one.
+            // Returns true if any order with this client ID exists (open OR terminal).
+            // A terminal (filled/cancelled) rescue OCO still means "don't place a duplicate" —
+            // the position was already protected/closed by the original order.
+            manager.CheckOrderExistsByClientId = (clientId) =>
+            {
+                try
+                {
+                    var order = _tradingClient.GetOrderAsync(clientId).SynchronouslyAwaitTaskResult();
+                    return order != null;
+                }
+                catch
+                {
+                    // GetOrderAsync throws on not-found (404) and on network errors.
+                    // In both cases, return false = "no known existing order, safe to place."
+                    return false;
+                }
+            };
+
             Log.Debug($"{nameof(AlpacaBrokerage)}.RegisterManager: BracketOrderManager registered.");
+        }
+
+        /// <summary>
+        /// Internal forwarding method for BracketOrderManager to emit brokerage messages.
+        /// OnMessage is protected on the Brokerage base class, so external callers need this.
+        /// </summary>
+        internal void EmitBrokerageMessage(BrokerageMessageEvent messageEvent)
+        {
+            OnMessage(messageEvent);
         }
 
         /// <summary>
@@ -198,6 +245,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 return;
             }
             _isInitialized = true;
+            Log.Trace($"AlpacaBrokerage.Initialize(): Alpaca Bracket Plugin v{BracketOrderManager.PluginVersion}");
             ValidateSubscription();
 
             SecurityKey tradingSecretKey = null;
@@ -305,13 +353,17 @@ namespace QuantConnect.Brokerages.Alpaca
         private void StreamingClient_SocketClosed(IStreamingClient client)
         {
             Log.Trace($"{nameof(StreamingClient_SocketClosed)}({client.GetStreamingClientName()}): SocketClosed");
-            if (_connected)
-            {
-                _connected = false;
-                // let consumers know, we will try to reconnect internally, if we can't lean will kill us
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, "Disconnected", "Brokerage Disconnected"));
-                _reconnectionResetEvent.Set();
-            }
+
+            // Always signal disconnect and trigger reconnection, even if _connected is already false.
+            // Multiple streaming clients may disconnect at different times (e.g., sequential disconnect→
+            // reconnect→disconnect). The downstream handlers are idempotent:
+            // - DefaultBrokerageMessageHandler resets the kill timer on each Disconnect message
+            // - _reconnectionResetEvent.Set() is idempotent (ManualResetEventSlim)
+            // - Connect() is gated by _connected, so reconnection won't double-connect
+            _connected = false;
+            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Disconnect, "Disconnected",
+                $"Brokerage Disconnected ({client.GetStreamingClientName()})"));
+            _reconnectionResetEvent.Set();
         }
 
         private void StreamingClient_SocketOpened(IStreamingClient client)
@@ -412,11 +464,13 @@ namespace QuantConnect.Brokerages.Alpaca
                                 BracketGroupId = recoveryGroupId,
                                 AlpacaLegOrderId = leg.OrderId,
                                 LegType = legType.Value,
+                                ClientOrderId = leg.ClientOrderId,
                             });
 
                             Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Flattened bracket leg " +
                                 $"AlpacaId={leg.OrderId}, Type={legType}, " +
-                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}");
+                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}, " +
+                                $"ClientOrderId={leg.ClientOrderId ?? "n/a"}");
                         }
 
                         leanOrders.Add(legLeanOrder);
@@ -462,11 +516,13 @@ namespace QuantConnect.Brokerages.Alpaca
                                 BracketGroupId = recoveryGroupId,
                                 AlpacaLegOrderId = leg.OrderId,
                                 LegType = legType.Value,
+                                ClientOrderId = leg.ClientOrderId,
                             });
 
                             Log.Debug($"{nameof(AlpacaBrokerage)}.GetOpenOrders: Flattened OCO leg " +
                                 $"AlpacaId={leg.OrderId}, Type={legType}, " +
-                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}");
+                                $"OrderType={leg.OrderType}, RecoveryGroupId={recoveryGroupId}, " +
+                                $"ClientOrderId={leg.ClientOrderId ?? "n/a"}");
 
                             leanOrders.Add(legLeanOrder);
                         }
@@ -660,8 +716,35 @@ namespace QuantConnect.Brokerages.Alpaca
                     var isPlaceCrossOrder = TryCrossZeroPositionOrder(order, holdingQuantity);
                     if (isPlaceCrossOrder == null)
                     {
-                        var orderRequest = order.CreateAlpacaOrder(order.AbsoluteQuantity, _symbolMapper, order.Type);
-                        var response = _tradingClient.PostOrderAsync(orderRequest).SynchronouslyAwaitTaskResult();
+                        var clientId = ClientOrderIdGenerator.ForStandalone();
+                        var orderRequest = order.CreateAlpacaOrder(order.AbsoluteQuantity, _symbolMapper, order.Type)
+                            .WithClientOrderId(clientId);
+
+                        IOrder response = null;
+                        try
+                        {
+                            response = _tradingClient.PostOrderAsync(orderRequest).SynchronouslyAwaitTaskResult();
+                        }
+                        catch (Exception ex) when (IsTransientNetworkError(ex))
+                        {
+                            Log.Error($"{nameof(AlpacaBrokerage)}.PlaceOrder: Transient error: {ex.Message}. " +
+                                $"Checking if order was placed via ClientOrderId={clientId}");
+                            try
+                            {
+                                response = _tradingClient.GetOrderAsync(clientId).SynchronouslyAwaitTaskResult();
+                                if (response == null)
+                                {
+                                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                                }
+                                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOrder: Order found at Alpaca despite error. " +
+                                    $"AlpacaId={response.OrderId}, Status={response.OrderStatus}");
+                            }
+                            catch (Exception)
+                            {
+                                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                            }
+                        }
+
                         if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
                         {
                             OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, $"{nameof(AlpacaBrokerage)} Place Order Failed") { Status = Orders.OrderStatus.Invalid });
@@ -737,8 +820,38 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
 
                 // Step 3: Submit to Alpaca
-                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Submitting bracket order to Alpaca for group {bracketProps.BracketGroupId}");
-                var response = _tradingClient.PostOrderAsync(bracketOrder).SynchronouslyAwaitTaskResult();
+                var entryClientId = ClientOrderIdGenerator.ForBracketEntry(bracketProps.BracketGroupId);
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Submitting bracket order to Alpaca for group {bracketProps.BracketGroupId}, ClientOrderId={entryClientId}");
+
+                IOrder response = null;
+                try
+                {
+                    response = _tradingClient.PostOrderAsync(bracketOrder.WithClientOrderId(entryClientId)).SynchronouslyAwaitTaskResult();
+                }
+                catch (Exception ex) when (IsTransientNetworkError(ex))
+                {
+                    // Transient network error — the order may or may not have been placed.
+                    // Use the client_order_id to check if Alpaca received it.
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Transient error for group {bracketProps.BracketGroupId}: {ex.Message}. " +
+                        $"Checking if order was placed via ClientOrderId={entryClientId}");
+                    try
+                    {
+                        response = _tradingClient.GetOrderAsync(entryClientId).SynchronouslyAwaitTaskResult();
+                        if (response != null)
+                        {
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Order found at Alpaca despite error. " +
+                                $"AlpacaId={response.OrderId}, Status={response.OrderStatus}, GroupId={bracketProps.BracketGroupId}");
+                        }
+                        else
+                        {
+                            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                    }
+                }
 
                 if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
                 {
@@ -780,8 +893,14 @@ namespace QuantConnect.Brokerages.Alpaca
             catch (Exception ex)
             {
                 Log.Error($"{nameof(AlpacaBrokerage)}.PlaceBracketOrder: Exception placing bracket order for group {bracketProps.BracketGroupId}: {ex}");
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
-                    $"Bracket Order Failed: {ex.Message}") { Status = Orders.OrderStatus.Invalid });
+                var invalidEvent = new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero,
+                    $"Bracket Order Failed: {ex.Message}") { Status = Orders.OrderStatus.Invalid };
+
+                // CRITICAL: ProcessOrderEvent BEFORE OnOrderEvent (same pattern as WS handler
+                // and reconciliation). This ensures the bracket manager transitions to Cancelled
+                // before the strategy's on_order_event fires.
+                _bracketManager?.ProcessOrderEvent(invalidEvent);
+                OnOrderEvent(invalidEvent);
             }
         }
 
@@ -828,10 +947,12 @@ namespace QuantConnect.Brokerages.Alpaca
                 BracketGroupId = bracketProps.BracketGroupId,
                 AlpacaLegOrderId = alpacaLeg.OrderId,
                 LegType = legType,
+                ClientOrderId = alpacaLeg.ClientOrderId,
             };
 
             Log.Debug($"{nameof(AlpacaBrokerage)}.CreateAndRegisterLegOrder: Registered leg in _bracketLegMapping. " +
-                $"AlpacaId={alpacaLeg.OrderId}, GroupId={bracketProps.BracketGroupId}, Type={legType}");
+                $"AlpacaId={alpacaLeg.OrderId}, GroupId={bracketProps.BracketGroupId}, Type={legType}, " +
+                $"ClientOrderId={alpacaLeg.ClientOrderId ?? "n/a"}");
 
             // Store in provisional mapping BEFORE firing the notification.
             // This ensures HandleTradeUpdate can find the order even if WebSocket
@@ -909,8 +1030,39 @@ namespace QuantConnect.Brokerages.Alpaca
                 }
 
                 // Step 3: Submit to Alpaca
-                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Submitting OCO to Alpaca for group {ocoProps.OcoGroupId}");
-                var response = _tradingClient.PostOrderAsync(ocoOrder).SynchronouslyAwaitTaskResult();
+                var ocoClientId = ocoProps.ClientOrderId
+                    ?? (ocoProps.IsRescueOco
+                        ? ClientOrderIdGenerator.ForRescueOco(ocoProps.OcoGroupId, BracketLegType.TakeProfit)
+                        : ClientOrderIdGenerator.ForOcoLeg(ocoProps.OcoGroupId, BracketLegType.TakeProfit));
+                Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Submitting OCO to Alpaca for group {ocoProps.OcoGroupId}, ClientOrderId={ocoClientId}");
+
+                IOrder response = null;
+                try
+                {
+                    response = _tradingClient.PostOrderAsync(ocoOrder.WithClientOrderId(ocoClientId)).SynchronouslyAwaitTaskResult();
+                }
+                catch (Exception ex) when (IsTransientNetworkError(ex))
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Transient error for group {ocoProps.OcoGroupId}: {ex.Message}. " +
+                        $"Checking if order was placed via ClientOrderId={ocoClientId}");
+                    try
+                    {
+                        response = _tradingClient.GetOrderAsync(ocoClientId).SynchronouslyAwaitTaskResult();
+                        if (response != null)
+                        {
+                            Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceOcoOrder: Order found at Alpaca despite error. " +
+                                $"AlpacaId={response.OrderId}, Status={response.OrderStatus}, GroupId={ocoProps.OcoGroupId}");
+                        }
+                        else
+                        {
+                            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                    }
+                }
 
                 if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
                 {
@@ -999,6 +1151,7 @@ namespace QuantConnect.Brokerages.Alpaca
                 BracketGroupId = ocoProps.OcoGroupId,
                 AlpacaLegOrderId = alpacaLeg.OrderId,
                 LegType = legType,
+                ClientOrderId = alpacaLeg.ClientOrderId,
             };
 
             // Store in provisional mapping
@@ -1031,7 +1184,7 @@ namespace QuantConnect.Brokerages.Alpaca
             try
             {
                 // TODO: Revert to Log.Debug when issue #28 is resolved
-                Log.Trace($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: {obj}");
+                Log.Trace($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: {obj} ClientOrderId={obj.Order.ClientOrderId ?? "n/a"}");
 
                 // --- Bracket leg identification ---
                 // Check if this trade update is for a known bracket leg by Alpaca order ID.
@@ -1101,7 +1254,11 @@ namespace QuantConnect.Brokerages.Alpaca
                     var ticket = _orderProvider.GetOrderTicket(leanOrder.Id);
                     if (ticket != null)
                     {
-                        // RegisterLegTicket is idempotent — it's fine to call multiple times
+                        // RegisterLegTicket no-ops if the group already holds a ticket with
+                        // a higher LEAN OrderId (stale-overwrite guard). Safe to call on
+                        // duplicate WS events — this call runs BEFORE the dedup gate below,
+                        // so the guard is the only thing that prevents a stale cancel event
+                        // for an old leg from overwriting a freshly-rescued ticket.
                         _bracketManager.RegisterLegTicket(bracketLegInfo.BracketGroupId, bracketLegInfo.LegType, ticket);
                     }
                 }
@@ -1147,6 +1304,7 @@ namespace QuantConnect.Brokerages.Alpaca
                     case TradeEvent.Canceled:
                     case TradeEvent.Replaced:
                     case TradeEvent.Expired:
+                    case TradeEvent.DoneForDay:
                         if (_duplicationExecutionOrderIdByBrokerageOrderId.TryRemove(obj.Order.OrderId, out _))
                         {
                             if (newLeanOrderStatus == Orders.OrderStatus.UpdateSubmitted)
@@ -1186,22 +1344,48 @@ namespace QuantConnect.Brokerages.Alpaca
                             }
 
                             var statusEvent = new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero, message) { Status = newLeanOrderStatus };
-                            OnOrderEvent(statusEvent);
 
-                            // Forward cancel/reject/expire events to BracketOrderManager for state tracking
+                            // CRITICAL: ProcessOrderEvent BEFORE OnOrderEvent.
+                            // This guarantees BracketGroup.State is updated when the strategy's
+                            // on_order_event fires. (PRD R5.5)
                             var groupId = isBracketLeg ? bracketLegInfo?.BracketGroupId : null;
                             groupId ??= _bracketManager?.GetGroupIdForOrder(leanOrder.Id);
                             if (groupId != null)
                             {
                                 _bracketManager?.ProcessOrderEvent(statusEvent);
+                            }
 
-                                // Safety-net cleanup: when a bracket group becomes complete,
-                                // sweep provisional entries for any remaining legs of this group.
-                                // Normally each leg's cancel event triggers individual cleanup at
-                                // line 843, but if Alpaca fails to deliver a leg event, this
-                                // prevents a memory leak.
+                            OnOrderEvent(statusEvent);
+
+                            // --- Bracket leg mapping cleanup on terminal events ---
+                            // Once a leg reaches a terminal state (Canceled, Rejected,
+                            // Expired, DoneForDay), further WS events for the same Alpaca
+                            // order ID are duplicates / late replays. Remove the mapping
+                            // so those duplicates don't classify as bracket legs at the
+                            // top of HandleTradeUpdate and trigger a stale RegisterLegTicket
+                            // call at line 1258 BEFORE the dedup gate suppresses them.
+                            //
+                            // Replaced is explicitly excluded — the remap block at line
+                            // 1321 has already swapped the entry to the new Alpaca ID.
+                            if (isBracketLeg
+                                && obj.Event != TradeEvent.Replaced
+                                && newLeanOrderStatus.IsClosed())
+                            {
+                                if (_bracketLegMapping.TryRemove(obj.Order.OrderId, out _))
+                                {
+                                    Log.Debug($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}: " +
+                                        $"Removed terminal bracket-leg mapping. AlpacaId={obj.Order.OrderId}, " +
+                                        $"GroupId={bracketLegInfo.BracketGroupId}, LegType={bracketLegInfo.LegType}, " +
+                                        $"Event={obj.Event}.");
+                                }
+                            }
+
+                            // Safety-net cleanup: when a bracket group becomes terminal,
+                            // sweep provisional entries for any remaining legs of this group.
+                            if (groupId != null)
+                            {
                                 var group = _bracketManager?.GetGroup(groupId);
-                                if (group != null && group.IsComplete && _provisionalBracketLegOrders.Count > 0)
+                                if (group != null && group.IsTerminal && _provisionalBracketLegOrders.Count > 0)
                                 {
                                     foreach (var kvp in _provisionalBracketLegOrders)
                                     {
@@ -1254,7 +1438,10 @@ namespace QuantConnect.Brokerages.Alpaca
                         // Skip this event to avoid flooding logs
                         return;
                     default:
-                        Log.Trace($"{nameof(AlpacaBrokerage)}.{nameof(HandleTradeUpdate)}.Event: {obj.Event}. TradeUpdate: {obj}");
+                        // No log here: the full TradeUpdate payload was already
+                        // logged at the top of HandleTradeUpdate (line ~1187),
+                        // and that message contains obj.Event. Re-emitting the
+                        // same data with an "Event:" prefix is redundant.
                         return;
                 }
 
@@ -1267,8 +1454,10 @@ namespace QuantConnect.Brokerages.Alpaca
 
                 if (newLeanOrderStatus.IsClosed())
                 {
-                    // cleanup
-                    _orderIdToFillQuantity.TryRemove(leanOrder.Id, out _);
+                    // Don't delete fill quantity — reconciliation may still need it to compute
+                    // delta=0 and skip this order. Record close time for deferred cleanup.
+                    // See _orderFillClosedAt doc comment for full rationale.
+                    _orderFillClosedAt[leanOrder.Id] = DateTime.UtcNow;
                 }
 
                 var fee = new OrderFee(new CashAmount(0, Currencies.USD));
@@ -1285,17 +1474,18 @@ namespace QuantConnect.Brokerages.Alpaca
                     FillQuantity = accumulativeFilledQuantity - previouslyFilledAmount,
                 };
 
+                // CRITICAL: ProcessOrderEvent BEFORE OnOrderEvent.
+                // This guarantees BracketGroup.State is updated when the strategy's
+                // on_order_event fires. (PRD R5.5)
+                if (isBracketLeg || _bracketManager?.GetGroupIdForOrder(leanOrder.Id) != null)
+                {
+                    _bracketManager?.ProcessOrderEvent(orderEvent);
+                }
+
                 // if we filled the order and have another contingent order waiting, submit it
                 if (!TryHandleRemainingCrossZeroOrder(leanOrder, orderEvent))
                 {
                     OnOrderEvent(orderEvent);
-                }
-
-                // Forward fill/partial fill events to BracketOrderManager for state tracking.
-                // This must happen after OnOrderEvent so the order status is updated in LEAN first.
-                if (isBracketLeg || _bracketManager?.GetGroupIdForOrder(leanOrder.Id) != null)
-                {
-                    _bracketManager?.ProcessOrderEvent(orderEvent);
                 }
             }
             catch (Exception ex)
@@ -1525,8 +1715,35 @@ namespace QuantConnect.Brokerages.Alpaca
         /// </returns>
         protected override CrossZeroOrderResponse PlaceCrossZeroOrder(CrossZeroFirstOrderRequest crossZeroOrderRequest, bool isPlaceOrderWithLeanEvent)
         {
-            var orderRequest = crossZeroOrderRequest.LeanOrder.CreateAlpacaOrder(crossZeroOrderRequest.AbsoluteOrderQuantity, _symbolMapper, crossZeroOrderRequest.OrderType);
-            var response = _tradingClient.PostOrderAsync(orderRequest).SynchronouslyAwaitTaskResult();
+            var clientId = ClientOrderIdGenerator.ForStandalone();
+            var orderRequest = crossZeroOrderRequest.LeanOrder.CreateAlpacaOrder(crossZeroOrderRequest.AbsoluteOrderQuantity, _symbolMapper, crossZeroOrderRequest.OrderType)
+                .WithClientOrderId(clientId);
+
+            IOrder response = null;
+            try
+            {
+                response = _tradingClient.PostOrderAsync(orderRequest).SynchronouslyAwaitTaskResult();
+            }
+            catch (Exception ex) when (IsTransientNetworkError(ex))
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.PlaceCrossZeroOrder: Transient error: {ex.Message}. " +
+                    $"Checking if order was placed via ClientOrderId={clientId}");
+                try
+                {
+                    response = _tradingClient.GetOrderAsync(clientId).SynchronouslyAwaitTaskResult();
+                    if (response == null)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                    }
+                    Log.Debug($"{nameof(AlpacaBrokerage)}.PlaceCrossZeroOrder: Order found at Alpaca despite error. " +
+                        $"AlpacaId={response.OrderId}, Status={response.OrderStatus}");
+                }
+                catch (Exception)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                }
+            }
+
             if (response == null || response.OrderStatus == AlpacaMarket.OrderStatus.Rejected)
             {
                 return new CrossZeroOrderResponse(string.Empty, false);
@@ -1557,6 +1774,9 @@ namespace QuantConnect.Brokerages.Alpaca
 
             ConnectAndAuthenticate(_orderStreamingClient);
             _connected = true;
+
+            // Start reconciliation timer for live trading (Layer 1 + Layer 2)
+            StartReconciliationTimer();
         }
 
         /// <summary>
@@ -1651,6 +1871,8 @@ namespace QuantConnect.Brokerages.Alpaca
 
         public override void Dispose()
         {
+            _reconciliationTimer?.Dispose();
+            _reconciliationTimer = null;
             StopQuoteFlushTimer();
 
             // Dispose all direct-feed enumerators
@@ -1718,6 +1940,8 @@ namespace QuantConnect.Brokerages.Alpaca
                 case TradeEvent.PartialFill:
                     return Orders.OrderStatus.PartiallyFilled;
                 case TradeEvent.Expired:
+                    return Orders.OrderStatus.Canceled;
+                case TradeEvent.DoneForDay:
                     return Orders.OrderStatus.Canceled;
                 default:
                     return Orders.OrderStatus.New;
@@ -1881,6 +2105,751 @@ namespace QuantConnect.Brokerages.Alpaca
                 Environment.Exit(1);
             }
         }
+
+        #region Reconciliation — Layer 1 + Layer 2
+
+        /// <summary>
+        /// Starts the reconciliation timer. Called during brokerage initialization (live only).
+        /// 30-second initial delay, 60-second period.
+        /// </summary>
+        internal void StartReconciliationTimer()
+        {
+            if (_reconciliationTimer != null) return;
+
+            _reconciliationTimer = new Timer(_ =>
+            {
+                try
+                {
+                    ReconcileOrderStateAsync().GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.ReconciliationTimer: {ex.Message}");
+                }
+            }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60));
+
+            Log.Debug($"{nameof(AlpacaBrokerage)}.StartReconciliationTimer: Timer started (30s delay, 60s period).");
+        }
+
+        /// <summary>
+        /// Pauses the reconciliation timer. Called during WebSocket reconnection.
+        /// </summary>
+        internal void PauseReconciliationTimer()
+        {
+            _reconciliationTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+            Log.Debug($"{nameof(AlpacaBrokerage)}.PauseReconciliationTimer: Timer paused.");
+        }
+
+        /// <summary>
+        /// Resumes the reconciliation timer after WebSocket reconnection.
+        /// Triggers an immediate catch-up run before resuming normal 60s cycle.
+        /// </summary>
+        internal void ResumeReconciliationTimer()
+        {
+            // Immediate run (0ms delay), then resume 60s cycle
+            _reconciliationTimer?.Change(TimeSpan.Zero, TimeSpan.FromSeconds(60));
+            Log.Debug($"{nameof(AlpacaBrokerage)}.ResumeReconciliationTimer: Timer resumed with immediate catch-up.");
+        }
+
+        /// <summary>
+        /// Layer 1: Periodic order state reconciliation.
+        /// Polls Alpaca REST for actual order states and emits synthetic OrderEvents
+        /// for any transitions the WebSocket missed.
+        /// </summary>
+        private async Task ReconcileOrderStateAsync()
+        {
+            if (_bracketManager == null) return;
+
+            // --- Phase 1 (no lock): REST I/O ---
+            // Build Alpaca-side snapshot of order states
+
+            // Pass 1: Fetch all open orders from Alpaca
+            IReadOnlyList<IOrder> alpacaOpenOrders;
+            try
+            {
+                var request = new ListOrdersRequest
+                {
+                    OrderStatusFilter = OrderStatusFilter.Open,
+                    RollUpNestedOrders = false,
+                };
+                alpacaOpenOrders = await _tradingClient.ListOrdersAsync(request).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileOrderState: Failed to list open orders: {ex.Message}");
+                return;
+            }
+
+            var alpacaOpenOrderIds = new HashSet<Guid>(alpacaOpenOrders.Select(o => o.OrderId));
+
+            // Pass 2: For each LEAN open order not found in the open set, query individually
+            var leanOpenOrders = _orderProvider.GetOpenOrders();
+            var alpacaSnapshot = new Dictionary<Guid, AlpacaOrderSnapshot>();
+
+            // Build snapshot from open orders
+            foreach (var alpacaOrder in alpacaOpenOrders)
+            {
+                alpacaSnapshot[alpacaOrder.OrderId] = new AlpacaOrderSnapshot
+                {
+                    OrderId = alpacaOrder.OrderId,
+                    Status = alpacaOrder.OrderStatus,
+                    FilledQuantity = alpacaOrder.FilledQuantity,
+                    AverageFillPrice = alpacaOrder.AverageFillPrice,
+                    FilledAt = alpacaOrder.FilledAtUtc,
+                    ReplacedByOrderId = alpacaOrder.ReplacedByOrderId,
+                    ClientOrderId = alpacaOrder.ClientOrderId,
+                };
+            }
+
+            // Individual lookups for LEAN open orders not in Alpaca's open set
+            foreach (var leanOrder in leanOpenOrders)
+            {
+                if (leanOrder.BrokerId == null || leanOrder.BrokerId.Count == 0) continue;
+                var brokerageId = leanOrder.BrokerId.Last(); // Use last (current) ID
+                if (!Guid.TryParse(brokerageId, out var alpacaGuid)) continue;
+
+                if (!alpacaOpenOrderIds.Contains(alpacaGuid) && !alpacaSnapshot.ContainsKey(alpacaGuid))
+                {
+                    try
+                    {
+                        var alpacaOrder = await _tradingClient.GetOrderAsync(alpacaGuid).ConfigureAwait(false);
+                        if (alpacaOrder != null)
+                        {
+                            alpacaSnapshot[alpacaOrder.OrderId] = new AlpacaOrderSnapshot
+                            {
+                                OrderId = alpacaOrder.OrderId,
+                                Status = alpacaOrder.OrderStatus,
+                                FilledQuantity = alpacaOrder.FilledQuantity,
+                                AverageFillPrice = alpacaOrder.AverageFillPrice,
+                                FilledAt = alpacaOrder.FilledAtUtc,
+                                ReplacedByOrderId = alpacaOrder.ReplacedByOrderId,
+                                ClientOrderId = alpacaOrder.ClientOrderId,
+                            };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Trace($"{nameof(AlpacaBrokerage)}.ReconcileOrderState: " +
+                            $"Individual lookup failed for {alpacaGuid}: {ex.Message}");
+                    }
+                }
+            }
+
+            // --- Phase 2 (inside lock): detect + emit ---
+            var discrepancyCount = 0;
+
+            _messageHandler.WithLockedStream(() =>
+            {
+                foreach (var leanOrder in leanOpenOrders)
+                {
+                    // Re-check order status inside the lock — a WS event may have processed
+                    // this order between Phase 1 (GetOpenOrders) and Phase 2 (this lock).
+                    // If the order is no longer open, skip it to avoid duplicate events.
+                    // NOTE: leanOrder is a Clone() from Phase 1 — its Status field is frozen
+                    // at clone time and won't reflect WS-driven updates. The _orderFillClosedAt
+                    // check catches orders whose WS fill arrived after cloning.
+                    if (leanOrder.Status.IsClosed() || _orderFillClosedAt.ContainsKey(leanOrder.Id))
+                    {
+                        continue;
+                    }
+
+                    if (leanOrder.BrokerId == null || leanOrder.BrokerId.Count == 0) continue;
+                    var brokerageId = leanOrder.BrokerId.Last();
+                    if (!Guid.TryParse(brokerageId, out var alpacaGuid)) continue;
+
+                    if (!alpacaSnapshot.TryGetValue(alpacaGuid, out var snapshot))
+                    {
+                        Log.Trace($"[PLUGIN:RECONCILED] LEAN order {leanOrder.Id} (alpaca={alpacaGuid}) " +
+                            $"not found in Alpaca snapshot.");
+                        continue;
+                    }
+
+                    var clientIdCtx = snapshot.ClientOrderId != null ? $", clientId={snapshot.ClientOrderId}" : "";
+
+                    try
+                    {
+                        // Case 1: Terminal at Alpaca, open in LEAN
+                        if (IsTerminalAlpacaStatus(snapshot.Status) && leanOrder.Status.IsOpen())
+                        {
+                            if (snapshot.FilledQuantity > 0)
+                            {
+                                // Terminal order with fills — emit synthetic fill regardless of
+                                // terminal status (Filled, Canceled-with-fills, Expired-with-fills,
+                                // DoneForDay-with-fills). This catches missed fills during WS
+                                // disconnect, cancel-then-fill races, and any other scenario where
+                                // Alpaca filled an order that LEAN missed.
+                                EmitSyntheticFill(leanOrder, snapshot, "case1-terminal-with-fill");
+                                discrepancyCount++;
+
+                                // If not fully filled (e.g., Canceled after partial fill), also
+                                // emit cancel for the unfilled remainder so LEAN marks the order
+                                // as terminal.
+                                if (snapshot.Status != AlpacaMarket.OrderStatus.Filled)
+                                {
+                                    var syntheticCancel = new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero,
+                                        $"[Reconciled] Order {snapshot.Status} at Alpaca after partial fill")
+                                    {
+                                        Status = Orders.OrderStatus.Canceled
+                                    };
+                                    _bracketManager?.ProcessOrderEvent(syntheticCancel);
+                                    OnOrderEvent(syntheticCancel);
+                                }
+                            }
+                            else
+                            {
+                                // Pure terminal with zero fills — emit synthetic cancel
+                                var statusMsg = snapshot.Status == AlpacaMarket.OrderStatus.DoneForDay
+                                    ? "DoneForDay" : snapshot.Status.ToString();
+                                var syntheticEvent = new OrderEvent(leanOrder, DateTime.UtcNow, OrderFee.Zero,
+                                    $"[Reconciled] Order {statusMsg} at Alpaca (missed WebSocket event)")
+                                {
+                                    Status = Orders.OrderStatus.Canceled
+                                };
+
+                                _bracketManager?.ProcessOrderEvent(syntheticEvent);
+                                OnOrderEvent(syntheticEvent);
+                                discrepancyCount++;
+
+                                Log.Trace($"[PLUGIN:RECONCILED] Synthetic cancel for LEAN order {leanOrder.Id}: " +
+                                    $"Alpaca status={snapshot.Status}{clientIdCtx}");
+                            }
+                        }
+                        // Case 2: Missed fills
+                        else if (snapshot.FilledQuantity > 0)
+                        {
+                            _orderIdToFillQuantity.TryGetValue(leanOrder.Id, out var knownFillQty);
+                            var alpacaSignedQty = leanOrder.Direction == OrderDirection.Buy
+                                ? snapshot.FilledQuantity
+                                : -snapshot.FilledQuantity;
+                            var delta = alpacaSignedQty - knownFillQty;
+
+                            if (Math.Abs(delta) > 0)
+                            {
+                                EmitSyntheticFill(leanOrder, snapshot, "case2-missed-fill");
+                                discrepancyCount++;
+                            }
+                        }
+                        // Case 3: Replaced status
+                        else if (snapshot.Status == AlpacaMarket.OrderStatus.Replaced &&
+                                 snapshot.ReplacedByOrderId.HasValue)
+                        {
+                            HandleReplacedOrder(leanOrder, snapshot);
+                            discrepancyCount++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"[PLUGIN:RECONCILED] Error processing LEAN order {leanOrder.Id}: {ex.Message}");
+                    }
+                }
+            });
+
+            Log.Trace($"[PLUGIN:RECONCILED] Reconciliation cycle complete: " +
+                $"{leanOpenOrders.Count} orders checked, {discrepancyCount} discrepancies found.");
+
+            // Sweep stale fill-tracking tombstones (entries closed > 5 minutes ago).
+            // This prevents unbounded growth of _orderIdToFillQuantity / _orderFillClosedAt.
+            var tombstoneCutoff = DateTime.UtcNow.AddMinutes(-5);
+            foreach (var kvp in _orderFillClosedAt)
+            {
+                if (kvp.Value < tombstoneCutoff)
+                {
+                    _orderIdToFillQuantity.TryRemove(kvp.Key, out _);
+                    _orderFillClosedAt.TryRemove(kvp.Key, out _);
+                }
+            }
+
+            // Run Layer 2 protective invariant (timer-triggered)
+            try
+            {
+                await ReconcileProtectiveInvariantAsync(isTimerTriggered: true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileOrderState: Layer 2 failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Emits a synthetic fill event for a missed fill detected by reconciliation.
+        /// </summary>
+        private void EmitSyntheticFill(Order leanOrder, AlpacaOrderSnapshot snapshot, string reason)
+        {
+            _orderIdToFillQuantity.TryGetValue(leanOrder.Id, out var knownFillQty);
+            var alpacaSignedQty = leanOrder.Direction == OrderDirection.Buy
+                ? snapshot.FilledQuantity
+                : -snapshot.FilledQuantity;
+            var delta = alpacaSignedQty - knownFillQty;
+
+            if (Math.Abs(delta) == 0) return;
+
+            // Update fill tracking
+            _orderIdToFillQuantity[leanOrder.Id] = alpacaSignedQty;
+
+            var isFull = Math.Abs(alpacaSignedQty) >= Math.Abs(leanOrder.Quantity);
+            var status = isFull ? Orders.OrderStatus.Filled : Orders.OrderStatus.PartiallyFilled;
+            var fillPrice = snapshot.AverageFillPrice ?? 0m;
+            var fillTime = snapshot.FilledAt ?? DateTime.UtcNow;
+
+            var syntheticEvent = new OrderEvent(leanOrder, fillTime, OrderFee.Zero,
+                $"[Reconciled:{reason}] Fill detected via REST reconciliation")
+            {
+                Status = status,
+                FillPrice = fillPrice,
+                FillQuantity = delta,
+            };
+
+            // Guard: skip synthetic fills for brackets that are already terminal (Closed/Cancelled).
+            // This prevents double-counting when WS fills arrive before reconciliation runs.
+            var syntheticGroupId = _bracketManager?.GetGroupIdForOrder(leanOrder.Id);
+            if (syntheticGroupId != null)
+            {
+                var syntheticGroup = _bracketManager?.GetGroup(syntheticGroupId);
+                if (syntheticGroup?.IsTerminal == true)
+                {
+                    Log.Debug($"[PLUGIN:RECONCILED] Skipping synthetic fill for order {leanOrder.Id} — " +
+                        $"bracket group {syntheticGroupId} is terminal (state={syntheticGroup.State})");
+                    return;
+                }
+            }
+
+            _bracketManager?.ProcessOrderEvent(syntheticEvent);
+            OnOrderEvent(syntheticEvent);
+
+            _bracketManager?.EmitPluginMessage("[PLUGIN:RECONCILED]", new Dictionary<string, object>
+            {
+                ["severity"] = "info",
+                ["group_id"] = _bracketManager?.GetGroupIdForOrder(leanOrder.Id),
+                ["symbol"] = leanOrder.Symbol.Value,
+                ["msg"] = $"Synthetic fill: {delta} shares at {fillPrice}",
+                ["event_type"] = "fill",
+                ["fill_qty"] = delta,
+                ["fill_price"] = fillPrice,
+            });
+
+            Log.Trace($"[PLUGIN:RECONCILED] Synthetic fill for LEAN order {leanOrder.Id}: " +
+                $"delta={delta}, price={fillPrice}, reason={reason}");
+        }
+
+        /// <summary>
+        /// Handles a Replaced status detected by reconciliation (Layer 1 Case 3).
+        /// </summary>
+        private void HandleReplacedOrder(Order leanOrder, AlpacaOrderSnapshot snapshot)
+        {
+            if (!snapshot.ReplacedByOrderId.HasValue) return;
+
+            var newAlpacaId = snapshot.ReplacedByOrderId.Value;
+            var oldAlpacaId = snapshot.OrderId;
+
+            // Emit OnOrderIdChangedEvent so LEAN updates Order.BrokerId
+            OnOrderIdChangedEvent(new BrokerageOrderIdChangedEvent
+            {
+                OrderId = leanOrder.Id,
+                BrokerId = new List<string> { newAlpacaId.ToString() }
+            });
+
+            // Remap _bracketLegMapping
+            if (_bracketLegMapping.TryRemove(oldAlpacaId, out var legInfo))
+            {
+                legInfo.AlpacaLegOrderId = newAlpacaId;
+                _bracketLegMapping[newAlpacaId] = legInfo;
+            }
+
+            // Remap dedup map
+            if (_duplicationExecutionOrderIdByBrokerageOrderId.TryRemove(oldAlpacaId, out var execIds))
+            {
+                _duplicationExecutionOrderIdByBrokerageOrderId[newAlpacaId] = execIds;
+            }
+
+            _bracketManager?.EmitPluginMessage("[PLUGIN:REPLACED_ID]", new Dictionary<string, object>
+            {
+                ["severity"] = "info",
+                ["group_id"] = legInfo?.BracketGroupId,
+                ["symbol"] = leanOrder.Symbol.Value,
+                ["msg"] = $"Order ID remapped: {oldAlpacaId} → {newAlpacaId}",
+                ["old_id"] = oldAlpacaId.ToString(),
+                ["new_id"] = newAlpacaId.ToString(),
+            });
+
+            Log.Trace($"[PLUGIN:RECONCILED] Replaced order {oldAlpacaId} → {newAlpacaId} " +
+                $"for LEAN order {leanOrder.Id}");
+        }
+
+        /// <summary>
+        /// Returns true if the Alpaca order status is terminal.
+        /// </summary>
+        private static bool IsTerminalAlpacaStatus(AlpacaMarket.OrderStatus status)
+        {
+            return status == AlpacaMarket.OrderStatus.Filled ||
+                   status == AlpacaMarket.OrderStatus.Canceled ||
+                   status == AlpacaMarket.OrderStatus.Expired ||
+                   status == AlpacaMarket.OrderStatus.Replaced ||
+                   status == AlpacaMarket.OrderStatus.DoneForDay ||
+                   status == AlpacaMarket.OrderStatus.Rejected;
+        }
+
+        /// <summary>
+        /// Returns true if the exception indicates a transient network error
+        /// where the request may or may not have reached Alpaca.
+        /// Used for idempotent retry: if the order was assigned a client_order_id,
+        /// we can query Alpaca by that ID to determine if the order was actually placed.
+        /// </summary>
+        private static bool IsTransientNetworkError(Exception ex)
+        {
+            if (ex is HttpRequestException) return true;
+            if (ex is TaskCanceledException) return true;
+            if (ex is OperationCanceledException) return true;
+            if (ex.InnerException is HttpRequestException) return true;
+            if (ex.InnerException is TaskCanceledException) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Layer 2: Protective invariant check.
+        /// Verifies every Protected bracket has active stop + target orders at Alpaca.
+        /// </summary>
+        private async Task ReconcileProtectiveInvariantAsync(bool isTimerTriggered)
+        {
+            if (_bracketManager == null) return;
+
+            var activeBrackets = _bracketManager.ActiveBrackets;
+
+            foreach (var group in activeBrackets)
+            {
+                if (group.State != BracketState.Protected) continue;
+
+                // Timer-triggered: skip brackets that entered Protected < 30s ago
+                if (isTimerTriggered && group.ProtectedEnteredAt.HasValue &&
+                    (DateTime.UtcNow - group.ProtectedEnteredAt.Value).TotalSeconds < 30)
+                {
+                    continue;
+                }
+
+                // Event-triggered guard (R2.5b): skip if EITHER exit leg ticket is not yet
+                // registered. After entry fill or rescue OCO, both legs are registered
+                // asynchronously — there's a brief window where one is null. Checking both
+                // avoids false positives during the registration window.
+                if (group.StopTicket == null || group.TargetTicket == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    // Query Alpaca directly for each leg by its brokerage ID.
+                    // This is the authoritative check — it returns the order regardless of
+                    // whether it's "open", "held", "new", etc. Alpaca bracket stop legs are
+                    // often in "held" status and excluded from ListOrdersAsync(Open), so a
+                    // bulk open-orders query produces false positives. Individual GetOrderAsync
+                    // calls are targeted (one per suspicious leg, max 2 per bracket) and
+                    // return the actual Alpaca-side state.
+                    var stopBrokerId = group.StopTicket != null
+                        ? _orderProvider.GetOrderById(group.StopTicket.OrderId)?.BrokerId?.LastOrDefault()
+                        : null;
+                    var targetBrokerId = group.TargetTicket != null
+                        ? _orderProvider.GetOrderById(group.TargetTicket.OrderId)?.BrokerId?.LastOrDefault()
+                        : null;
+
+                    var hasStop = await CheckLegExistsAtAlpacaAsync(stopBrokerId, "stop", group);
+                    var hasTarget = await CheckLegExistsAtAlpacaAsync(targetBrokerId, "target", group);
+
+                    if (!hasStop || !hasTarget)
+                    {
+                        // Decide log severity based on whether this is the
+                        // actionable case or a known-noise case.
+                        //
+                        //   * Both legs missing AND shares still exposed
+                        //     (remainingQty > 0) → genuine protective-invariant
+                        //     failure; we log ERROR and kick off a rescue.
+                        //
+                        //   * Both legs missing AND remainingQty <= 0 → the
+                        //     trade already completed fully (exit filled then
+                        //     OCO cancelled its sibling, and both show up
+                        //     terminal on the next invariant scan). The
+                        //     position is already closed — pure noise.
+                        //
+                        //   * Single leg missing → normal OCO cascade
+                        //     mid-flight: one exit is filling/just-filled,
+                        //     Alpaca cancels the sibling. The surviving leg
+                        //     still protects the position while the fill
+                        //     completes. Pure noise.
+                        //
+                        // Noise cases: demote to Trace so the main log stays
+                        // clean, but still emit the plugin message so ops /
+                        // downstream subscribers can see the event if they
+                        // want to. Plugin-message severity is dropped to
+                        // "info" for these cases (was "warning").
+                        decimal currentRemainingQtyForLog;
+                        lock (group.StateLock)
+                        {
+                            currentRemainingQtyForLog =
+                                Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                        }
+                        bool isBothMissing = !hasStop && !hasTarget;
+                        bool isActionable = isBothMissing && currentRemainingQtyForLog > 0;
+                        string invariantSummary =
+                            $"[PLUGIN:PROTECTIVE_INVARIANT] Protected bracket {group.GroupId} " +
+                            $"for {group.Symbol.Value} missing protective orders. " +
+                            $"HasStop={hasStop} (brokerId={stopBrokerId}), " +
+                            $"HasTarget={hasTarget} (brokerId={targetBrokerId}). " +
+                            $"RemainingQty={currentRemainingQtyForLog}.";
+                        if (isActionable)
+                        {
+                            Log.Error(invariantSummary);
+                        }
+                        else
+                        {
+                            // Known-noise path: OCO cascade mid-flight or
+                            // trade already closed. Keep a Trace breadcrumb
+                            // so the sequence is still auditable post-hoc.
+                            Log.Trace(invariantSummary);
+                        }
+
+                        if (!hasStop && !hasTarget)
+                        {
+                            // Both legs missing — possible cancel cascade that ProcessExitEvent didn't catch
+                            // (e.g., WS events lost). Attempt rescue if conditions are met.
+                            var protectedAge = group.ProtectedEnteredAt.HasValue
+                                ? (DateTime.UtcNow - group.ProtectedEnteredAt.Value).TotalSeconds
+                                : 0;
+
+                            // Compute remainingQty and attempt state transition under lock
+                            // to avoid torn reads of ExitFilledQuantity (128-bit decimal).
+                            decimal remainingQty = 0;
+                            bool transitioned = false;
+
+                            if (protectedAge >= 90 && !group.InvariantRescueAttempted)
+                            {
+                                lock (group.StateLock)
+                                {
+                                    if (group.State == BracketState.Protected)
+                                    {
+                                        remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                                        if (remainingQty > 0)
+                                        {
+                                            group.InvariantRescueAttempted = true;
+                                            group.TryTransition(BracketState.Protected, BracketState.Rescuing,
+                                                $"invariant rescue: both legs missing, {remainingQty} shares unprotected");
+                                            transitioned = true;
+                                        }
+                                    }
+                                }
+
+                                if (transitioned && group.State == BracketState.Rescuing)
+                                {
+                                    Log.Error($"[PLUGIN:PROTECTIVE_INVARIANT] Initiating rescue for " +
+                                        $"{group.Symbol.Value} group {group.GroupId}. " +
+                                        $"RemainingQty={remainingQty}, ProtectedAge={protectedAge:F0}s");
+
+                                    _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT_RESCUE]", new Dictionary<string, object>
+                                    {
+                                        ["severity"] = "critical",
+                                        ["group_id"] = group.GroupId,
+                                        ["symbol"] = group.Symbol.Value,
+                                        ["msg"] = $"Both protective legs missing after {protectedAge:F0}s. Rescuing {remainingQty} shares.",
+                                        ["remaining_qty"] = remainingQty,
+                                    });
+
+                                    _bracketManager?.ExecuteRescue(group, remainingQty);
+                                }
+                            }
+
+                            if (!transitioned)
+                            {
+                                // Either conditions not met or remainingQty == 0.
+                                lock (group.StateLock)
+                                {
+                                    remainingQty = Math.Abs(group.FilledQuantity) - group.ExitFilledQuantity;
+                                }
+                                // severity: "info" when the trade is already
+                                // closed (remainingQty == 0) — pure noise
+                                // from the invariant's perspective.
+                                // "warning" when there ARE shares but we
+                                // didn't transition (e.g. age below threshold,
+                                // or rescue already attempted) — that's still
+                                // operator-visible.
+                                string severity = remainingQty <= 0 ? "info" : "warning";
+                                _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT]", new Dictionary<string, object>
+                                {
+                                    ["severity"] = severity,
+                                    ["group_id"] = group.GroupId,
+                                    ["symbol"] = group.Symbol.Value,
+                                    ["msg"] = $"Both legs missing. RemainingQty={remainingQty}, " +
+                                              $"Age={protectedAge:F0}s, AlreadyAttempted={group.InvariantRescueAttempted}",
+                                });
+                            }
+                        }
+                        else
+                        {
+                            // Only one leg missing — don't rescue. The surviving leg still
+                            // protects the position. Almost always this is a normal OCO
+                            // cascade mid-flight: one exit is filling (or just filled) and
+                            // Alpaca cancelled its sibling. severity="info" to reflect
+                            // that — real ops intervention is only needed when BOTH legs
+                            // are missing AND shares remain exposed.
+                            _bracketManager?.EmitPluginMessage("[PLUGIN:PROTECTIVE_INVARIANT]", new Dictionary<string, object>
+                            {
+                                ["severity"] = "info",
+                                ["group_id"] = group.GroupId,
+                                ["symbol"] = group.Symbol.Value,
+                                ["msg"] = $"Single leg missing. HasStop={hasStop}, HasTarget={hasTarget}",
+                                ["leg"] = !hasStop ? "stop" : "target",
+                                ["price"] = !hasStop ? (object)group.StopLossPrice : group.TakeProfitPrice,
+                            });
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileProtectiveInvariant: " +
+                        $"Error checking group {group.GroupId}: {ex.Message}");
+                }
+            }
+
+            // Layer 2b: Detect brackets stuck in Rescuing state with stale pending rescues.
+            // Safety net for cases where CheckPendingRescue missed the window (e.g., the
+            // ticket status was stale when the event-driven check ran, but is now updated).
+            if (isTimerTriggered)
+            {
+                foreach (var group in activeBrackets)
+                {
+                    if (group.State != BracketState.Rescuing) continue;
+
+                    try
+                    {
+                        var pendingRescue = _bracketManager?.GetPendingRescue(group.GroupId);
+                        if (pendingRescue == null) continue;
+
+                        var rescueAge = (DateTime.UtcNow - pendingRescue.RequestedAt).TotalSeconds;
+                        if (rescueAge < 30) continue; // give event-driven path time to complete
+
+                        // Tickets should be fully updated by now (OnOrderEvent ran long ago).
+                        // CheckPendingRescue with no currentEvent falls back to ticket status,
+                        // which is correct here since all events have been fully processed.
+                        _bracketManager?.CheckPendingRescue(group.GroupId, group);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"{nameof(AlpacaBrokerage)}.ReconcileProtectiveInvariant: " +
+                            $"Error checking stale rescue for group {group.GroupId}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a bracket leg exists at Alpaca by querying the individual order.
+        /// Returns true if the order exists and is in a non-terminal status (New, Accepted,
+        /// Held, PartiallyFilled, PendingNew, PendingReplace, PendingCancel — any status
+        /// that means the order is still live or held at Alpaca).
+        /// </summary>
+        private async Task<bool> CheckLegExistsAtAlpacaAsync(string brokerId, string legName, BracketGroup group)
+        {
+            if (string.IsNullOrEmpty(brokerId))
+            {
+                // Fallback: try client_order_id lookup if a Layer 2 replacement was placed
+                var clientId = legName == "stop" ? group.Layer2StopClientOrderId : group.Layer2TargetClientOrderId;
+                if (!string.IsNullOrEmpty(clientId))
+                {
+                    try
+                    {
+                        var fallbackOrder = await _tradingClient.GetOrderAsync(clientId).ConfigureAwait(false);
+                        if (fallbackOrder != null && !IsTerminalAlpacaStatus(fallbackOrder.OrderStatus))
+                        {
+                            Log.Debug($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: " +
+                                $"found via client_order_id fallback ({clientId}), AlpacaId={fallbackOrder.OrderId}");
+                            return true;
+                        }
+                    }
+                    catch { /* fallback failed, proceed with false */ }
+                }
+
+                Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: no brokerId in LEAN");
+                return false;
+            }
+
+            if (!Guid.TryParse(brokerId, out var alpacaGuid))
+            {
+                Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: invalid brokerId format: {brokerId}");
+                return false;
+            }
+
+            try
+            {
+                var alpacaOrder = await _tradingClient.GetOrderAsync(alpacaGuid).ConfigureAwait(false);
+                if (alpacaOrder == null)
+                {
+                    return false;
+                }
+
+                // Terminal statuses mean the order is gone
+                var isTerminal = alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Filled ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Canceled ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Expired ||
+                                 alpacaOrder.OrderStatus == AlpacaMarket.OrderStatus.Replaced;
+
+                if (isTerminal)
+                {
+                    Log.Trace($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: " +
+                        $"Alpaca order {alpacaGuid} is terminal ({alpacaOrder.OrderStatus})");
+                    return false;
+                }
+
+                // Order exists and is non-terminal (open, held, pending, etc.)
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // If we can't reach Alpaca, assume the order is there to avoid false alarms
+                Log.Error($"[PLUGIN:PROTECTIVE_INVARIANT] {group.Symbol.Value} {legName}: " +
+                    $"Failed to query Alpaca for {alpacaGuid}: {ex.Message}. Assuming order exists.");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// FALLBACK EOD: Calls Alpaca's DELETE /v2/positions?cancel_orders=true
+        /// to cancel all orders and liquidate all positions.
+        /// Called by BracketOrderManager.LiquidateAllForEod() in live mode.
+        /// </summary>
+        internal bool LiquidateAllPositionsForEod()
+        {
+            try
+            {
+                Log.Debug($"{nameof(AlpacaBrokerage)}.LiquidateAllPositionsForEod: " +
+                    $"Calling Alpaca DELETE /v2/positions?cancel_orders=true");
+
+                // Use the trading client to close all positions
+                var result = _tradingClient.DeleteAllPositionsAsync(
+                    new DeleteAllPositionsRequest { CancelOrders = true }
+                ).GetAwaiter().GetResult();
+
+                Log.Debug($"{nameof(AlpacaBrokerage)}.LiquidateAllPositionsForEod: " +
+                    $"Alpaca responded with {result?.Count ?? 0} position closures.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"{nameof(AlpacaBrokerage)}.LiquidateAllPositionsForEod: Failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Snapshot of an Alpaca order's state, captured during Phase 1 of reconciliation.
+        /// </summary>
+        private class AlpacaOrderSnapshot
+        {
+            public Guid OrderId { get; set; }
+            public AlpacaMarket.OrderStatus Status { get; set; }
+            public decimal FilledQuantity { get; set; }
+            public decimal? AverageFillPrice { get; set; }
+            public DateTime? FilledAt { get; set; }
+            public Guid? ReplacedByOrderId { get; set; }
+            public string ClientOrderId { get; set; }
+        }
+
+        #endregion
     }
 
     /// <summary>
@@ -1899,9 +2868,12 @@ namespace QuantConnect.Brokerages.Alpaca
         /// <summary>Whether this is a stop-loss or take-profit leg.</summary>
         public BracketLegType LegType { get; set; }
 
+        /// <summary>The client order ID set at submission time (null for pre-existing orders or Alpaca-assigned child legs).</summary>
+        public string ClientOrderId { get; set; }
+
         public override string ToString()
         {
-            return $"BracketLegInfo[Group={BracketGroupId}, AlpacaId={AlpacaLegOrderId}, Type={LegType}]";
+            return $"BracketLegInfo[Group={BracketGroupId}, AlpacaId={AlpacaLegOrderId}, Type={LegType}, ClientId={ClientOrderId ?? "n/a"}]";
         }
     }
 }
